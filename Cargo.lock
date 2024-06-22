@@ -9451,6 +9451,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "object"
+version = "0.36.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "081b846d1d56ddfc18fdf1a922e4f6e07a11768ea1b92dec44e42b72712ccfce"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "oid-registry"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10203,13 +10212,13 @@ dependencies = [
  "pallet-contracts-fixtures",
  "pallet-contracts-proc-macro",
  "pallet-contracts-uapi",
- "pallet-insecure-randomness-collective-flip",
  "pallet-message-queue",
  "pallet-proxy",
  "pallet-timestamp",
  "pallet-utility",
  "parity-scale-codec",
  "paste",
+ "polkavm 0.10.0",
  "pretty_assertions",
  "rand",
  "rand_pcg",
@@ -10237,7 +10246,7 @@ dependencies = [
  "anyhow",
  "frame-system",
  "parity-wasm",
- "polkavm-linker",
+ "polkavm-linker 0.10.0",
  "sp-runtime",
  "tempfile",
  "toml 0.8.8",
@@ -10257,7 +10266,6 @@ dependencies = [
  "pallet-contracts-fixtures",
  "pallet-contracts-proc-macro",
  "pallet-contracts-uapi",
- "pallet-insecure-randomness-collective-flip",
  "pallet-message-queue",
  "pallet-proxy",
  "pallet-timestamp",
@@ -14972,9 +14980,21 @@ checksum = "8a3693e5efdb2bf74e449cd25fd777a28bd7ed87e41f5d5da75eb31b4de48b94"
 dependencies = [
  "libc",
  "log",
- "polkavm-assembler",
- "polkavm-common",
- "polkavm-linux-raw",
+ "polkavm-assembler 0.9.0",
+ "polkavm-common 0.9.0",
+ "polkavm-linux-raw 0.9.0",
+]
+
+[[package]]
+name = "polkavm"
+version = "0.10.0"
+source = "git+https://github.com/koute/polkavm.git?branch=tmp_new_api_wip#01da70599bfd4154939b4cb39700d50263e987fd"
+dependencies = [
+ "libc",
+ "log",
+ "polkavm-assembler 0.10.0",
+ "polkavm-common 0.10.0",
+ "polkavm-linux-raw 0.10.0",
 ]
 
 [[package]]
@@ -14987,10 +15007,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "polkavm-assembler"
+version = "0.10.0"
+source = "git+https://github.com/koute/polkavm.git?branch=tmp_new_api_wip#01da70599bfd4154939b4cb39700d50263e987fd"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "polkavm-common"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d9428a5cfcc85c5d7b9fc4b6a18c4b802d0173d768182a51cc7751640f08b92"
+dependencies = [
+ "log",
+]
+
+[[package]]
+name = "polkavm-common"
+version = "0.10.0"
+source = "git+https://github.com/koute/polkavm.git?branch=tmp_new_api_wip#01da70599bfd4154939b4cb39700d50263e987fd"
 dependencies = [
  "log",
 ]
@@ -15010,7 +15046,7 @@ version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c4fdfc49717fb9a196e74a5d28e0bc764eb394a2c803eb11133a31ac996c60c"
 dependencies = [
- "polkavm-common",
+ "polkavm-common 0.9.0",
  "proc-macro2 1.0.82",
  "quote 1.0.35",
  "syn 2.0.61",
@@ -15036,7 +15072,21 @@ dependencies = [
  "hashbrown 0.14.3",
  "log",
  "object 0.32.2",
- "polkavm-common",
+ "polkavm-common 0.9.0",
+ "regalloc2 0.9.3",
+ "rustc-demangle",
+]
+
+[[package]]
+name = "polkavm-linker"
+version = "0.10.0"
+source = "git+https://github.com/koute/polkavm.git?branch=tmp_new_api_wip#01da70599bfd4154939b4cb39700d50263e987fd"
+dependencies = [
+ "gimli 0.28.0",
+ "hashbrown 0.14.3",
+ "log",
+ "object 0.36.1",
+ "polkavm-common 0.10.0",
  "regalloc2 0.9.3",
  "rustc-demangle",
 ]
@@ -15046,6 +15096,11 @@ name = "polkavm-linux-raw"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "26e85d3456948e650dff0cfc85603915847faf893ed1e66b020bb82ef4557120"
+
+[[package]]
+name = "polkavm-linux-raw"
+version = "0.10.0"
+source = "git+https://github.com/koute/polkavm.git?branch=tmp_new_api_wip#01da70599bfd4154939b4cb39700d50263e987fd"
 
 [[package]]
 name = "polling"
@@ -17521,7 +17576,7 @@ dependencies = [
 name = "sc-executor-common"
 version = "0.29.0"
 dependencies = [
- "polkavm",
+ "polkavm 0.9.3",
  "sc-allocator",
  "sp-maybe-compressed-blob",
  "sp-wasm-interface 20.0.0",
@@ -17534,7 +17589,7 @@ name = "sc-executor-polkavm"
 version = "0.29.0"
 dependencies = [
  "log",
- "polkavm",
+ "polkavm 0.9.3",
  "sc-executor-common",
  "sp-wasm-interface 20.0.0",
 ]
@@ -21420,7 +21475,7 @@ dependencies = [
  "merkleized-metadata",
  "parity-scale-codec",
  "parity-wasm",
- "polkavm-linker",
+ "polkavm-linker 0.9.2",
  "sc-executor",
  "sp-core",
  "sp-io",

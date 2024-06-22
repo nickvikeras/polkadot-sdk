@@ -22,7 +22,6 @@ use crate::{
 	AccountIdOf,
 };
 use frame_support::traits::Currency;
-use pretty_assertions::assert_eq;
 use std::cell::RefCell;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -72,7 +71,7 @@ impl Tracing<Test> for TestDebug {
 impl CallInterceptor<Test> for TestDebug {
 	fn intercept_call(
 		contract_address: &<Test as frame_system::Config>::AccountId,
-		_entry_point: &ExportedFunction,
+		_entry_point: ExportedFunction,
 		_input_data: &[u8],
 	) -> Option<ExecResult> {
 		INTERCEPTED_ADDRESS.with(|i| {
@@ -98,132 +97,146 @@ impl CallSpan for TestCallSpan {
 	}
 }
 
-#[test]
-fn debugging_works() {
-	let (wasm_caller, _) = compile_module::<Test>("call").unwrap();
-	let (wasm_callee, _) = compile_module::<Test>("store_call").unwrap();
+/// We can only run the tests if we have a riscv toolchain installed
+#[cfg(feature = "riscv")]
+mod run_tests {
+	use super::*;
+	use pretty_assertions::assert_eq;
 
-	fn current_stack() -> Vec<DebugFrame> {
-		DEBUG_EXECUTION_TRACE.with(|stack| stack.borrow().clone())
-	}
+	#[test]
+	fn debugging_works() {
+		let (wasm_caller, _) = compile_module::<Test>("call").unwrap();
+		let (wasm_callee, _) = compile_module::<Test>("store_call").unwrap();
 
-	fn deploy(wasm: Vec<u8>) -> AccountId32 {
-		Contracts::bare_instantiate(
-			ALICE,
-			0,
-			GAS_LIMIT,
-			None,
-			Code::Upload(wasm),
-			vec![],
-			vec![],
-			DebugInfo::Skip,
-			CollectEvents::Skip,
-		)
-		.result
-		.unwrap()
-		.account_id
-	}
-
-	fn constructor_frame(contract_account: &AccountId32, after: bool) -> DebugFrame {
-		DebugFrame {
-			contract_account: contract_account.clone(),
-			call: ExportedFunction::Constructor,
-			input: vec![],
-			result: if after { Some(vec![]) } else { None },
+		fn current_stack() -> Vec<DebugFrame> {
+			DEBUG_EXECUTION_TRACE.with(|stack| stack.borrow().clone())
 		}
-	}
 
-	fn call_frame(contract_account: &AccountId32, args: Vec<u8>, after: bool) -> DebugFrame {
-		DebugFrame {
-			contract_account: contract_account.clone(),
-			call: ExportedFunction::Call,
-			input: args,
-			result: if after { Some(vec![]) } else { None },
+		fn deploy(wasm: Vec<u8>) -> AccountId32 {
+			Contracts::bare_instantiate(
+				ALICE,
+				0,
+				GAS_LIMIT,
+				None,
+				Code::Upload(wasm),
+				vec![],
+				vec![],
+				DebugInfo::Skip,
+				CollectEvents::Skip,
+			)
+			.result
+			.unwrap()
+			.account_id
 		}
+
+		fn constructor_frame(contract_account: &AccountId32, after: bool) -> DebugFrame {
+			DebugFrame {
+				contract_account: contract_account.clone(),
+				call: ExportedFunction::Constructor,
+				input: vec![],
+				result: if after { Some(vec![]) } else { None },
+			}
+		}
+
+		fn call_frame(contract_account: &AccountId32, args: Vec<u8>, after: bool) -> DebugFrame {
+			DebugFrame {
+				contract_account: contract_account.clone(),
+				call: ExportedFunction::Call,
+				input: args,
+				result: if after { Some(vec![]) } else { None },
+			}
+		}
+
+		ExtBuilder::default().existential_deposit(200).build().execute_with(|| {
+			let _ = Balances::deposit_creating(&ALICE, 1_000_000);
+
+			assert_eq!(current_stack(), vec![]);
+
+			let addr_caller = deploy(wasm_caller);
+			let addr_callee = deploy(wasm_callee);
+
+			assert_eq!(
+				current_stack(),
+				vec![
+					constructor_frame(&addr_caller, false),
+					constructor_frame(&addr_caller, true),
+					constructor_frame(&addr_callee, false),
+					constructor_frame(&addr_callee, true),
+				]
+			);
+
+			let main_args = (100u32, &addr_callee.clone()).encode();
+			let inner_args = (100u32).encode();
+
+			assert_ok!(Contracts::call(
+				RuntimeOrigin::signed(ALICE),
+				addr_caller.clone(),
+				0,
+				GAS_LIMIT,
+				None,
+				main_args.clone()
+			));
+
+			let stack_top = current_stack()[4..].to_vec();
+			assert_eq!(
+				stack_top,
+				vec![
+					call_frame(&addr_caller, main_args.clone(), false),
+					call_frame(&addr_callee, inner_args.clone(), false),
+					call_frame(&addr_callee, inner_args, true),
+					call_frame(&addr_caller, main_args, true),
+				]
+			);
+		});
 	}
 
-	ExtBuilder::default().existential_deposit(200).build().execute_with(|| {
-		let _ = Balances::deposit_creating(&ALICE, 1_000_000);
+	#[test]
+	fn call_interception_works() {
+		let (wasm, _) = compile_module::<Test>("dummy").unwrap();
 
-		assert_eq!(current_stack(), vec![]);
+		ExtBuilder::default().existential_deposit(200).build().execute_with(|| {
+			let _ = Balances::deposit_creating(&ALICE, 1_000_000);
 
-		let addr_caller = deploy(wasm_caller);
-		let addr_callee = deploy(wasm_callee);
+			let account_id = Contracts::bare_instantiate(
+				ALICE,
+				0,
+				GAS_LIMIT,
+				None,
+				Code::Upload(wasm),
+				vec![],
+				// some salt to ensure that the address of this contract is unique among all tests
+				vec![0x41, 0x41, 0x41, 0x41],
+				DebugInfo::Skip,
+				CollectEvents::Skip,
+			)
+			.result
+			.unwrap()
+			.account_id;
 
-		assert_eq!(
-			current_stack(),
-			vec![
-				constructor_frame(&addr_caller, false),
-				constructor_frame(&addr_caller, true),
-				constructor_frame(&addr_callee, false),
-				constructor_frame(&addr_callee, true),
-			]
-		);
+			// no interception yet
+			assert_ok!(Contracts::call(
+				RuntimeOrigin::signed(ALICE),
+				account_id.clone(),
+				0,
+				GAS_LIMIT,
+				None,
+				vec![],
+			));
 
-		let main_args = (100u32, &addr_callee.clone()).encode();
-		let inner_args = (100u32).encode();
+			// intercept calls to this contract
+			INTERCEPTED_ADDRESS.with(|i| *i.borrow_mut() = Some(account_id.clone()));
 
-		assert_ok!(Contracts::call(
-			RuntimeOrigin::signed(ALICE),
-			addr_caller.clone(),
-			0,
-			GAS_LIMIT,
-			None,
-			main_args.clone()
-		));
-
-		let stack_top = current_stack()[4..].to_vec();
-		assert_eq!(
-			stack_top,
-			vec![
-				call_frame(&addr_caller, main_args.clone(), false),
-				call_frame(&addr_callee, inner_args.clone(), false),
-				call_frame(&addr_callee, inner_args, true),
-				call_frame(&addr_caller, main_args, true),
-			]
-		);
-	});
-}
-
-#[test]
-fn call_interception_works() {
-	let (wasm, _) = compile_module::<Test>("dummy").unwrap();
-
-	ExtBuilder::default().existential_deposit(200).build().execute_with(|| {
-		let _ = Balances::deposit_creating(&ALICE, 1_000_000);
-
-		let account_id = Contracts::bare_instantiate(
-			ALICE,
-			0,
-			GAS_LIMIT,
-			None,
-			Code::Upload(wasm),
-			vec![],
-			// some salt to ensure that the address of this contract is unique among all tests
-			vec![0x41, 0x41, 0x41, 0x41],
-			DebugInfo::Skip,
-			CollectEvents::Skip,
-		)
-		.result
-		.unwrap()
-		.account_id;
-
-		// no interception yet
-		assert_ok!(Contracts::call(
-			RuntimeOrigin::signed(ALICE),
-			account_id.clone(),
-			0,
-			GAS_LIMIT,
-			None,
-			vec![],
-		));
-
-		// intercept calls to this contract
-		INTERCEPTED_ADDRESS.with(|i| *i.borrow_mut() = Some(account_id.clone()));
-
-		assert_err_ignore_postinfo!(
-			Contracts::call(RuntimeOrigin::signed(ALICE), account_id, 0, GAS_LIMIT, None, vec![],),
-			<Error<Test>>::ContractReverted,
-		);
-	});
+			assert_err_ignore_postinfo!(
+				Contracts::call(
+					RuntimeOrigin::signed(ALICE),
+					account_id,
+					0,
+					GAS_LIMIT,
+					None,
+					vec![],
+				),
+				<Error<Test>>::ContractReverted,
+			);
+		});
+	}
 }

@@ -72,7 +72,7 @@ impl<T: Config> EngineMeter<T> {
 			.ok_or(Error::<T>::InvalidSchedule)?;
 
 		self.fuel.checked_sub(amount).ok_or_else(|| Error::<T>::OutOfGas)?;
-		Ok(Syncable(self.fuel))
+		Ok(Syncable(self.fuel.try_into().map_err(|_| Error::<T>::OutOfGas)?))
 	}
 }
 
@@ -86,10 +86,10 @@ pub struct RefTimeLeft(u64);
 ///
 /// Wrapped to make sure that the resource will be synced back the the executor.
 #[must_use]
-pub struct Syncable(u64);
+pub struct Syncable(polkavm::Gas);
 
-impl From<Syncable> for u64 {
-	fn from(from: Syncable) -> u64 {
+impl From<Syncable> for polkavm::Gas {
+	fn from(from: Syncable) -> Self {
 		from.0
 	}
 }
@@ -236,8 +236,13 @@ impl<T: Config> GasMeter<T> {
 	/// Needs to be called when entering a host function to update this meter with the
 	/// gas that was tracked by the executor. It tracks the latest seen total value
 	/// in order to compute the delta that needs to be charged.
-	pub fn sync_from_executor(&mut self, engine_fuel: u64) -> Result<RefTimeLeft, DispatchError> {
-		let weight_consumed = self.engine_meter.set_fuel(engine_fuel);
+	pub fn sync_from_executor(
+		&mut self,
+		engine_fuel: polkavm::Gas,
+	) -> Result<RefTimeLeft, DispatchError> {
+		let weight_consumed = self
+			.engine_meter
+			.set_fuel(engine_fuel.try_into().map_err(|_| Error::<T>::OutOfGas)?);
 		self.gas_left
 			.checked_reduce(weight_consumed)
 			.ok_or_else(|| Error::<T>::OutOfGas)?;

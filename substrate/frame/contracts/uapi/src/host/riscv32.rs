@@ -309,10 +309,6 @@ impl HostFn for HostFnImpl {
 		todo!()
 	}
 
-	fn instantiation_nonce() -> u64 {
-		todo!()
-	}
-
 	fn reentrance_count() -> u32 {
 		todo!()
 	}

@@ -22,7 +22,7 @@ wasm-instrument = { workspace = true, default-features = true }
 sc-allocator = { workspace = true, default-features = true }
 sp-maybe-compressed-blob = { workspace = true, default-features = true }
 sp-wasm-interface = { workspace = true, default-features = true }
-polkavm = { workspace = true }
+polkavm = { workspace = true, default-features = true}
 
 [features]
 default = []

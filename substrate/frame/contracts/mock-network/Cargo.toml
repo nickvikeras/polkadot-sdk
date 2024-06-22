@@ -21,7 +21,6 @@ pallet-balances = { workspace = true, default-features = true }
 pallet-contracts = { workspace = true, default-features = true }
 pallet-contracts-uapi = { workspace = true }
 pallet-contracts-proc-macro = { workspace = true, default-features = true }
-pallet-insecure-randomness-collective-flip = { workspace = true, default-features = true }
 pallet-message-queue = { workspace = true, default-features = true }
 pallet-proxy = { workspace = true, default-features = true }
 pallet-timestamp = { workspace = true, default-features = true }
@@ -55,7 +54,6 @@ std = [
 	"frame-system/std",
 	"pallet-balances/std",
 	"pallet-contracts/std",
-	"pallet-insecure-randomness-collective-flip/std",
 	"pallet-proxy/std",
 	"pallet-timestamp/std",
 	"pallet-utility/std",

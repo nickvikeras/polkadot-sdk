@@ -20,8 +20,11 @@ parity-wasm = { workspace = true }
 tempfile = { workspace = true }
 toml = { workspace = true }
 twox-hash = { workspace = true, default-features = true }
-polkavm-linker = { workspace = true, optional = true }
+polkavm-linker = { git = "https://github.com/koute/polkavm.git", branch = "tmp_new_api_wip" }
 anyhow = { workspace = true }
 
 [features]
-riscv = ["polkavm-linker"]
+# only if the feature is set we are building the test fixtures
+# this is because it requires a custom toolchain supporting polkavm
+# we will remove this once there is an upstream toolchain
+riscv = []

@@ -22,11 +22,11 @@ use crate::{
 	gas::{ChargedAmount, Token},
 	primitives::ExecReturnValue,
 	weights::WeightInfo,
-	BalanceOf, CodeHash, Config, DebugBufferVec, Error, SENTINEL,
+	BalanceOf, CodeHash, Config, DebugBufferVec, Error, LOG_TARGET, SENTINEL,
 };
 use alloc::{boxed::Box, vec, vec::Vec};
 use codec::{Decode, DecodeLimit, Encode, MaxEncodedLen};
-use core::fmt;
+use core::{fmt, marker::PhantomData};
 use frame_support::{
 	dispatch::DispatchInfo, ensure, pallet_prelude::DispatchResultWithPostInfo, parameter_types,
 	traits::Get, weights::Weight,
@@ -34,44 +34,192 @@ use frame_support::{
 use pallet_contracts_proc_macro::define_env;
 use pallet_contracts_uapi::{CallFlags, ReturnFlags};
 use sp_io::hashing::{blake2_128, blake2_256, keccak_256, sha2_256};
-use sp_runtime::{
-	traits::{Bounded, Zero},
-	DispatchError, RuntimeDebug,
-};
-use wasmi::{core::HostError, errors::LinkerError, Linker, Memory, Store};
+use sp_runtime::{traits::Zero, DispatchError, RuntimeDebug};
 
 type CallOf<T> = <T as frame_system::Config>::RuntimeCall;
 
 /// The maximum nesting depth a contract can use when encoding types.
 const MAX_DECODE_NESTING: u32 = 256;
 
-/// Passed to [`Environment`] to determine whether it should expose deprecated interfaces.
-pub enum AllowDeprecatedInterface {
-	/// No deprecated interfaces are exposed.
-	No,
-	/// Deprecated interfaces are exposed.
-	Yes,
+#[derive(Clone, Copy)]
+pub enum ApiVersion {
+	/// Expose all APIs even unversioned ones. Only used for testing and benchmarking.
+	UnsafeNewest,
+	/// Only expose API's up to and including the specified version.
+	Versioned(u16),
 }
 
-/// Passed to [`Environment`] to determine whether it should expose unstable interfaces.
-pub enum AllowUnstableInterface {
-	/// No unstable interfaces are exposed.
-	No,
-	/// Unstable interfaces are exposed.
-	Yes,
+/// Abstraction over the memory access within syscalls.
+///
+/// The reason for this abstraction is that we run syscalls on the host machine when
+/// benchmarking them. In that case we have direct access to the contracts memory. However, when
+/// running within PolkaVM we need to resort to copying as we can't map the contracts memory into
+/// the host (as of now).
+pub trait Memory<T: Config> {
+	/// Read designated chunk from the sandbox memory into the supplied buffer.
+	///
+	/// Returns `Err` if one of the following conditions occurs:
+	///
+	/// - requested buffer is not within the bounds of the sandbox memory.
+	fn read_into_buf(&self, ptr: u32, buf: &mut [u8]) -> Result<(), DispatchError>;
+
+	/// Write the given buffer to the designated location in the sandbox memory.
+	///
+	/// Returns `Err` if one of the following conditions occurs:
+	///
+	/// - designated area is not within the bounds of the sandbox memory.
+	fn write(&mut self, ptr: u32, buf: &[u8]) -> Result<(), DispatchError>;
+
+	/// Read designated chunk from the sandbox memory.
+	///
+	/// Returns `Err` if one of the following conditions occurs:
+	///
+	/// - requested buffer is not within the bounds of the sandbox memory.
+	fn read(&self, ptr: u32, len: u32) -> Result<Vec<u8>, DispatchError> {
+		let mut buf = vec![0u8; len as usize];
+		self.read_into_buf(ptr, buf.as_mut_slice())?;
+		Ok(buf)
+	}
+
+	/// Read designated chunk from the sandbox memory and attempt to decode into the specified type.
+	///
+	/// Returns `Err` if one of the following conditions occurs:
+	///
+	/// - requested buffer is not within the bounds of the sandbox memory.
+	/// - the buffer contents cannot be decoded as the required type.
+	///
+	/// # Note
+	///
+	/// There must be an extra benchmark for determining the influence of `len` with
+	/// regard to the overall weight.
+	fn read_as_unbounded<D: Decode>(&self, ptr: u32, len: u32) -> Result<D, DispatchError> {
+		let buf = self.read(ptr, len)?;
+		let decoded = D::decode_all_with_depth_limit(MAX_DECODE_NESTING, &mut buf.as_ref())
+			.map_err(|_| DispatchError::from(Error::<T>::DecodingFailed))?;
+		Ok(decoded)
+	}
+
+	/// Reads and decodes a type with a size fixed at compile time from contract memory.
+	///
+	/// # Only use on fixed size types
+	///
+	/// Don't use this for types where the encoded size is not fixed but merely bounded. Otherwise
+	/// this implementation will out of bound access the buffer declared by the guest. Some examples
+	/// of those bounded but not fixed types: Enums with data, `BoundedVec` or any compact encoded
+	/// integer.
+	///
+	/// # Note
+	///
+	/// The weight of reading a fixed value is included in the overall weight of any
+	/// contract callable function.
+	fn read_as<D: Decode + MaxEncodedLen>(&self, ptr: u32) -> Result<D, DispatchError> {
+		debug_assert_eq!(
+			D::encoded_fixed_size(),
+			Some(D::max_encoded_len()),
+			"Memory::read_as() can only be called on fixed size types. Use read_as_unbounded instead."
+		);
+		let buf = self.read(ptr, D::max_encoded_len() as u32)?;
+		let decoded = D::decode_with_depth_limit(MAX_DECODE_NESTING, &mut buf.as_ref())
+			.map_err(|_| DispatchError::from(Error::<T>::DecodingFailed))?;
+		Ok(decoded)
+	}
 }
 
-/// Trait implemented by the [`define_env`](pallet_contracts_proc_macro::define_env) macro for the
-/// emitted `Env` struct.
-pub trait Environment<HostState> {
-	/// Adds all declared functions to the supplied [`Linker`](wasmi::Linker) and
-	/// [`Store`](wasmi::Store).
-	fn define(
-		store: &mut Store<HostState>,
-		linker: &mut Linker<HostState>,
-		allow_unstable: AllowUnstableInterface,
-		allow_deprecated: AllowDeprecatedInterface,
-	) -> Result<(), LinkerError>;
+/// Allows syscalls access to the PolkaVM instance they are executing in.
+///
+/// In case a contract is executing within PolkaVM its `memory` argument will also implement
+/// this trait. The benchmarking implementation of syscalls will only require `Memory`
+/// to be implemented.
+trait PolkavmInstance<T: Config>: Memory<T> {
+	fn gas(&self) -> polkavm::Gas;
+	fn set_gas(&mut self, gas: polkavm::Gas);
+	fn read_input_regs(&self) -> (u32, u32, u32, u32, u32, u32);
+}
+
+// Memory implementation used in benchmarking where guest memory is mapped into the host.
+//
+// Please note that we could optimize the `read_as_*` functions by decoding directly from
+// memory without a copy. However, we don't do that because as it would change the behaviour
+// of those functions: A `read_as` with a `len` larger than the actual type can succeed
+// in the streaming implementation while it could fail with a segfault in the copy implementation.
+#[cfg(feature = "runtime-benchmarks")]
+pub struct MappedMemory<'a, T> {
+	memory: &'a mut [u8],
+	phantom: PhantomData<T>,
+}
+
+#[cfg(feature = "runtime-benchmarks")]
+impl<'a, T> MappedMemory<'a, T> {
+	pub fn new(memory: &'a mut [u8]) -> Self {
+		Self { memory, phantom: Default::default() }
+	}
+}
+
+#[cfg(feature = "runtime-benchmarks")]
+impl<'a, T: Config> Memory<T> for MappedMemory<'a, T> {
+	fn read_into_buf(&self, ptr: u32, buf: &mut [u8]) -> Result<(), DispatchError> {
+		let ptr = ptr as usize;
+		let bound_checked =
+			self.memory.get(ptr..ptr + buf.len()).ok_or_else(|| Error::<T>::OutOfBounds)?;
+		buf.copy_from_slice(bound_checked);
+		Ok(())
+	}
+
+	fn write(&mut self, ptr: u32, buf: &[u8]) -> Result<(), DispatchError> {
+		let ptr = ptr as usize;
+		let bound_checked = self
+			.memory
+			.get_mut(ptr..ptr + buf.len())
+			.ok_or_else(|| Error::<T>::OutOfBounds)?;
+		bound_checked.copy_from_slice(buf);
+		Ok(())
+	}
+}
+
+/// Memory implementation used for PolkaVM where guest memory has to be copied for access.
+pub struct PolkavmMemory<'a, T: Config> {
+	instance: &'a mut polkavm::RawInstance,
+	_phantom: PhantomData<T>,
+}
+
+impl<'a, T: Config> PolkavmMemory<'a, T> {
+	pub fn new(instance: &'a mut polkavm::RawInstance) -> Self {
+		Self { instance, _phantom: Default::default() }
+	}
+}
+
+impl<'a, T: Config> Memory<T> for PolkavmMemory<'a, T> {
+	fn read_into_buf(&self, ptr: u32, buf: &mut [u8]) -> Result<(), DispatchError> {
+		self.instance
+			.read_memory_into(ptr, buf)
+			.map(|_| ())
+			.map_err(|_| Error::<T>::OutOfBounds.into())
+	}
+
+	fn write(&mut self, ptr: u32, buf: &[u8]) -> Result<(), DispatchError> {
+		self.instance.write_memory(ptr, buf).map_err(|_| Error::<T>::OutOfBounds.into())
+	}
+}
+
+impl<'a, T: Config> PolkavmInstance<T> for PolkavmMemory<'a, T> {
+	fn gas(&self) -> polkavm::Gas {
+		self.instance.gas()
+	}
+
+	fn set_gas(&mut self, gas: polkavm::Gas) {
+		self.instance.set_gas(gas)
+	}
+
+	fn read_input_regs(&self) -> (u32, u32, u32, u32, u32, u32) {
+		(
+			self.instance.reg(polkavm::Reg::A0),
+			self.instance.reg(polkavm::Reg::A1),
+			self.instance.reg(polkavm::Reg::A2),
+			self.instance.reg(polkavm::Reg::A3),
+			self.instance.reg(polkavm::Reg::A4),
+			self.instance.reg(polkavm::Reg::A5),
+		)
+	}
 }
 
 /// Type of a storage key.
@@ -142,8 +290,6 @@ impl fmt::Display for TrapReason {
 	}
 }
 
-impl HostError for TrapReason {}
-
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 #[derive(Copy, Clone)]
 pub enum RuntimeCosts {
@@ -183,8 +329,6 @@ pub enum RuntimeCosts {
 	WeightToFee,
 	/// Weight of calling `seal_terminate`, passing the number of locked dependencies.
 	Terminate(u32),
-	/// Weight of calling `seal_random`. It includes the weight for copying the subject.
-	Random,
 	/// Weight of calling `seal_deposit_event` with the given number of topics and event size.
 	DepositEvent { num_topic: u32, len: u32 },
 	/// Weight of calling `seal_debug_message` per byte of passed message.
@@ -243,12 +387,6 @@ pub enum RuntimeCosts {
 	SetCodeHash,
 	/// Weight of calling `ecdsa_to_eth_address`
 	EcdsaToEthAddress,
-	/// Weight of calling `reentrance_count`
-	ReentranceCount,
-	/// Weight of calling `account_reentrance_count`
-	AccountReentranceCount,
-	/// Weight of calling `instantiation_nonce`
-	InstantiationNonce,
 	/// Weight of calling `lock_delegate_dependency`
 	LockDelegateDependency,
 	/// Weight of calling `unlock_delegate_dependency`
@@ -325,7 +463,6 @@ impl<T: Config> Token<T> for RuntimeCosts {
 			Now => T::WeightInfo::seal_now(),
 			WeightToFee => T::WeightInfo::seal_weight_to_fee(),
 			Terminate(locked_dependencies) => T::WeightInfo::seal_terminate(locked_dependencies),
-			Random => T::WeightInfo::seal_random(),
 			DepositEvent { num_topic, len } => T::WeightInfo::seal_deposit_event(num_topic, len),
 			DebugMessage(len) => T::WeightInfo::seal_debug_message(len),
 			SetStorage { new_bytes, old_bytes } =>
@@ -356,9 +493,6 @@ impl<T: Config> Token<T> for RuntimeCosts {
 			ChainExtension(weight) | CallRuntime(weight) | CallXcmExecute(weight) => weight,
 			SetCodeHash => T::WeightInfo::seal_set_code_hash(),
 			EcdsaToEthAddress => T::WeightInfo::seal_ecdsa_to_eth_address(),
-			ReentranceCount => T::WeightInfo::seal_reentrance_count(),
-			AccountReentranceCount => T::WeightInfo::seal_account_reentrance_count(),
-			InstantiationNonce => T::WeightInfo::seal_instantiation_nonce(),
 			LockDelegateDependency => T::WeightInfo::lock_delegate_dependency(),
 			UnlockDelegateDependency => T::WeightInfo::unlock_delegate_dependency(),
 		}
@@ -403,7 +537,6 @@ fn already_charged(_: u32) -> Option<RuntimeCosts> {
 pub struct Runtime<'a, E: Ext + 'a> {
 	ext: &'a mut E,
 	input_data: Option<Vec<u8>>,
-	memory: Option<Memory>,
 	chain_extension: Option<Box<<E::T as Config>::ChainExtension>>,
 }
 
@@ -412,70 +545,57 @@ impl<'a, E: Ext + 'a> Runtime<'a, E> {
 		Runtime {
 			ext,
 			input_data: Some(input_data),
-			memory: None,
 			chain_extension: Some(Box::new(Default::default())),
 		}
 	}
 
-	pub fn memory(&self) -> Option<Memory> {
-		self.memory
-	}
+	pub fn handle_interrupt(
+		&mut self,
+		interrupt: Result<polkavm::InterruptKind, polkavm::Error>,
+		instance: &mut polkavm::RawInstance,
+		api_version: ApiVersion,
+	) -> Option<ExecResult> {
+		use polkavm::InterruptKind::*;
 
-	pub fn set_memory(&mut self, memory: Memory) {
-		self.memory = Some(memory);
-	}
-
-	/// Converts the sandbox result and the runtime state into the execution outcome.
-	pub fn to_execution_result(self, sandbox_result: Result<(), wasmi::Error>) -> ExecResult {
-		use wasmi::{
-			core::TrapCode,
-			errors::{ErrorKind, FuelError},
-		};
-		use TrapReason::*;
-
-		let Err(error) = sandbox_result else {
-			// Contract returned from main function -> no data was returned.
-			return Ok(ExecReturnValue { flags: ReturnFlags::empty(), data: Vec::new() })
-		};
-		if let ErrorKind::Fuel(FuelError::OutOfFuel) = error.kind() {
-			// `OutOfGas` when host asks engine to consume more than left in the _store_.
-			// We should never get this case, as gas meter is being charged (and hence raises error)
-			// first.
-			return Err(Error::<E::T>::OutOfGas.into())
-		}
-		match error.as_trap_code() {
-			Some(TrapCode::OutOfFuel) => {
-				// `OutOfGas` during engine execution.
-				return Err(Error::<E::T>::OutOfGas.into())
+		match interrupt {
+			Err(error) => {
+				// in contrast to the other returns this "should" not happen: log level error
+				log::error!(target: LOG_TARGET, "polkavm execution error: {error}");
+				Some(Err(Error::<E::T>::ContractTrapped.into()))
 			},
-			Some(_trap_code) => {
-				// Otherwise the trap came from the contract itself.
-				return Err(Error::<E::T>::ContractTrapped.into())
+			Ok(Finished) =>
+				Some(Ok(ExecReturnValue { flags: ReturnFlags::empty(), data: Vec::new() })),
+			Ok(Trap(trap)) => {
+				// TODO: custom error
+				log::debug!(target: LOG_TARGET, "polkavm trap: {trap:?}");
+				Some(Err(Error::<E::T>::ContractTrapped.into()))
 			},
-			None => {},
+			Ok(Segfault(segfault)) => {
+				// TODO: custom error
+				log::debug!(target: LOG_TARGET, "polkavm segfault: {segfault:?}");
+				Some(Err(Error::<E::T>::ContractTrapped.into()))
+			},
+			Ok(NotEnoughGas) => Some(Err(Error::<E::T>::OutOfGas.into())),
+			Ok(Step) => None,
+			Ok(Ecalli(syscall_number)) => {
+				let mut memory = PolkavmMemory::new(instance);
+				match self.handle_ecall(&mut memory, syscall_number, api_version) {
+					Ok(None) => None,
+					Ok(Some(return_value)) => {
+						instance.set_reg(polkavm::Reg::A0, return_value);
+						None
+					},
+					Err(TrapReason::Return(ReturnData { flags, data })) =>
+						match ReturnFlags::from_bits(flags) {
+							None => Some(Err(Error::<E::T>::InvalidCallFlags.into())),
+							Some(flags) => Some(Ok(ExecReturnValue { flags, data })),
+						},
+					Err(TrapReason::Termination) =>
+						Some(Ok(ExecReturnValue { flags: ReturnFlags::empty(), data: Vec::new() })),
+					Err(TrapReason::SupervisorError(error)) => Some(Err(error.into())),
+				}
+			},
 		}
-		// If we encoded a reason then it is some abort generated by a host function.
-		if let Some(reason) = &error.downcast_ref::<TrapReason>() {
-			match &reason {
-				Return(ReturnData { flags, data }) => {
-					let flags =
-						ReturnFlags::from_bits(*flags).ok_or(Error::<E::T>::InvalidCallFlags)?;
-					return Ok(ExecReturnValue { flags, data: data.to_vec() })
-				},
-				Termination =>
-					return Ok(ExecReturnValue { flags: ReturnFlags::empty(), data: Vec::new() }),
-				SupervisorError(error) => return Err((*error).into()),
-			}
-		}
-
-		// Any other error is returned only if instantiation or linking failed (i.e.
-		// wasm binary tried to import a function that is not provided by the host).
-		// This shouldn't happen because validation process ought to reject such binaries.
-		//
-		// Because panics are really undesirable in the runtime code, we treat this as
-		// a trap for now. Eventually, we might want to revisit this.
-		log::debug!("Code rejected: {:?}", error);
-		Err(Error::<E::T>::CodeRejected.into())
 	}
 
 	/// Get a mutable reference to the inner `Ext`.
@@ -525,87 +645,6 @@ impl<'a, E: Ext + 'a> Runtime<'a, E> {
 		}
 	}
 
-	/// Read designated chunk from the sandbox memory.
-	///
-	/// Returns `Err` if one of the following conditions occurs:
-	///
-	/// - requested buffer is not within the bounds of the sandbox memory.
-	pub fn read_sandbox_memory(
-		&self,
-		memory: &[u8],
-		ptr: u32,
-		len: u32,
-	) -> Result<Vec<u8>, DispatchError> {
-		ensure!(len <= self.ext.schedule().limits.max_memory_size(), Error::<E::T>::OutOfBounds);
-		let mut buf = vec![0u8; len as usize];
-		self.read_sandbox_memory_into_buf(memory, ptr, buf.as_mut_slice())?;
-		Ok(buf)
-	}
-
-	/// Read designated chunk from the sandbox memory into the supplied buffer.
-	///
-	/// Returns `Err` if one of the following conditions occurs:
-	///
-	/// - requested buffer is not within the bounds of the sandbox memory.
-	pub fn read_sandbox_memory_into_buf(
-		&self,
-		memory: &[u8],
-		ptr: u32,
-		buf: &mut [u8],
-	) -> Result<(), DispatchError> {
-		let ptr = ptr as usize;
-		let bound_checked =
-			memory.get(ptr..ptr + buf.len()).ok_or_else(|| Error::<E::T>::OutOfBounds)?;
-		buf.copy_from_slice(bound_checked);
-		Ok(())
-	}
-
-	/// Reads and decodes a type with a size fixed at compile time from contract memory.
-	///
-	/// # Note
-	///
-	/// The weight of reading a fixed value is included in the overall weight of any
-	/// contract callable function.
-	pub fn read_sandbox_memory_as<D: Decode + MaxEncodedLen>(
-		&self,
-		memory: &[u8],
-		ptr: u32,
-	) -> Result<D, DispatchError> {
-		let ptr = ptr as usize;
-		let mut bound_checked = memory.get(ptr..).ok_or_else(|| Error::<E::T>::OutOfBounds)?;
-
-		let decoded = D::decode_with_depth_limit(MAX_DECODE_NESTING, &mut bound_checked)
-			.map_err(|_| DispatchError::from(Error::<E::T>::DecodingFailed))?;
-		Ok(decoded)
-	}
-
-	/// Read designated chunk from the sandbox memory and attempt to decode into the specified type.
-	///
-	/// Returns `Err` if one of the following conditions occurs:
-	///
-	/// - requested buffer is not within the bounds of the sandbox memory.
-	/// - the buffer contents cannot be decoded as the required type.
-	///
-	/// # Note
-	///
-	/// There must be an extra benchmark for determining the influence of `len` with
-	/// regard to the overall weight.
-	pub fn read_sandbox_memory_as_unbounded<D: Decode>(
-		&self,
-		memory: &[u8],
-		ptr: u32,
-		len: u32,
-	) -> Result<D, DispatchError> {
-		let ptr = ptr as usize;
-		let mut bound_checked =
-			memory.get(ptr..ptr + len as usize).ok_or_else(|| Error::<E::T>::OutOfBounds)?;
-
-		let decoded = D::decode_all_with_depth_limit(MAX_DECODE_NESTING, &mut bound_checked)
-			.map_err(|_| DispatchError::from(Error::<E::T>::DecodingFailed))?;
-
-		Ok(decoded)
-	}
-
 	/// Write the given buffer and its length to the designated locations in sandbox memory and
 	/// charge gas according to the token returned by `create_token`.
 	//
@@ -623,11 +662,11 @@ impl<'a, E: Ext + 'a> Runtime<'a, E> {
 	/// it returns. `create_token` receives the variable amount of bytes that are about to be copied
 	/// by this function.
 	///
-	/// In addition to the error conditions of `write_sandbox_memory` this functions returns
+	/// In addition to the error conditions of `Memory::write` this functions returns
 	/// `Err` if the size of the buffer located at `out_ptr` is too small to fit `buf`.
-	pub fn write_sandbox_output(
+	pub fn write_sandbox_output<M: Memory<E::T>>(
 		&mut self,
-		memory: &mut [u8],
+		memory: &mut M,
 		out_ptr: u32,
 		out_len_ptr: u32,
 		buf: &[u8],
@@ -639,7 +678,7 @@ impl<'a, E: Ext + 'a> Runtime<'a, E> {
 		}
 
 		let buf_len = buf.len() as u32;
-		let len: u32 = self.read_sandbox_memory_as(memory, out_len_ptr)?;
+		let len: u32 = memory.read_as(out_len_ptr)?;
 
 		if len < buf_len {
 			return Err(Error::<E::T>::OutputBufferTooSmall.into())
@@ -649,26 +688,8 @@ impl<'a, E: Ext + 'a> Runtime<'a, E> {
 			self.charge_gas(costs)?;
 		}
 
-		self.write_sandbox_memory(memory, out_ptr, buf)?;
-		self.write_sandbox_memory(memory, out_len_ptr, &buf_len.encode())
-	}
-
-	/// Write the given buffer to the designated location in the sandbox memory.
-	///
-	/// Returns `Err` if one of the following conditions occurs:
-	///
-	/// - designated area is not within the bounds of the sandbox memory.
-	fn write_sandbox_memory(
-		&self,
-		memory: &mut [u8],
-		ptr: u32,
-		buf: &[u8],
-	) -> Result<(), DispatchError> {
-		let ptr = ptr as usize;
-		let bound_checked =
-			memory.get_mut(ptr..ptr + buf.len()).ok_or_else(|| Error::<E::T>::OutOfBounds)?;
-		bound_checked.copy_from_slice(buf);
-		Ok(())
+		memory.write(out_ptr, buf)?;
+		memory.write(out_len_ptr, &buf_len.encode())
 	}
 
 	/// Computes the given hash function on the supplied input.
@@ -683,9 +704,9 @@ impl<'a, E: Ext + 'a> Runtime<'a, E> {
 	/// # Note
 	///
 	/// The `input` and `output` buffers may overlap.
-	fn compute_hash_on_intermediate_buffer<F, R>(
+	fn compute_hash_on_intermediate_buffer<F, R, M: Memory<E::T>>(
 		&self,
-		memory: &mut [u8],
+		memory: &mut M,
 		hash_fn: F,
 		input_ptr: u32,
 		input_len: u32,
@@ -696,11 +717,11 @@ impl<'a, E: Ext + 'a> Runtime<'a, E> {
 		R: AsRef<[u8]>,
 	{
 		// Copy input into supervisor memory.
-		let input = self.read_sandbox_memory(memory, input_ptr, input_len)?;
+		let input = memory.read(input_ptr, input_len)?;
 		// Compute the hash on the input buffer using the given hash function.
 		let hash = hash_fn(&input);
 		// Write the resulting hash back into the sandboxed output buffer.
-		self.write_sandbox_memory(memory, output_ptr, hash.as_ref())?;
+		memory.write(output_ptr, hash.as_ref())?;
 		Ok(())
 	}
 
@@ -734,15 +755,15 @@ impl<'a, E: Ext + 'a> Runtime<'a, E> {
 			(err, _) => Self::err_into_return_code(err),
 		}
 	}
-	fn decode_key(
+	fn decode_key<M: Memory<E::T>>(
 		&self,
-		memory: &[u8],
+		memory: &M,
 		key_type: KeyType,
 		key_ptr: u32,
 	) -> Result<crate::exec::Key<E::T>, TrapReason> {
 		let res = match key_type {
 			KeyType::Fix => {
-				let key = self.read_sandbox_memory(memory, key_ptr, 32u32)?;
+				let key = memory.read(key_ptr, 32u32)?;
 				Key::try_from_fix(key)
 			},
 			KeyType::Var(len) => {
@@ -750,7 +771,7 @@ impl<'a, E: Ext + 'a> Runtime<'a, E> {
 					len <= <<E as Ext>::T as Config>::MaxStorageKeyLen::get(),
 					Error::<E::T>::DecodingFailed
 				);
-				let key = self.read_sandbox_memory(memory, key_ptr, len)?;
+				let key = memory.read(key_ptr, len)?;
 				Key::try_from_var(key)
 			},
 		};
@@ -758,9 +779,9 @@ impl<'a, E: Ext + 'a> Runtime<'a, E> {
 		res.map_err(|_| Error::<E::T>::DecodingFailed.into())
 	}
 
-	fn set_storage(
+	fn set_storage<M: Memory<E::T>>(
 		&mut self,
-		memory: &[u8],
+		memory: &M,
 		key_type: KeyType,
 		key_ptr: u32,
 		value_ptr: u32,
@@ -773,7 +794,7 @@ impl<'a, E: Ext + 'a> Runtime<'a, E> {
 			return Err(Error::<E::T>::ValueTooLarge.into())
 		}
 		let key = self.decode_key(memory, key_type, key_ptr)?;
-		let value = Some(self.read_sandbox_memory(memory, value_ptr, value_len)?);
+		let value = Some(memory.read(value_ptr, value_len)?);
 		let write_outcome = self.ext.set_storage(&key, value, false)?;
 
 		self.adjust_gas(
@@ -783,9 +804,9 @@ impl<'a, E: Ext + 'a> Runtime<'a, E> {
 		Ok(write_outcome.old_len_with_sentinel())
 	}
 
-	fn clear_storage(
+	fn clear_storage<M: Memory<E::T>>(
 		&mut self,
-		memory: &[u8],
+		memory: &M,
 		key_type: KeyType,
 		key_ptr: u32,
 	) -> Result<u32, TrapReason> {
@@ -797,9 +818,9 @@ impl<'a, E: Ext + 'a> Runtime<'a, E> {
 		Ok(outcome.old_len_with_sentinel())
 	}
 
-	fn get_storage(
+	fn get_storage<M: Memory<E::T>>(
 		&mut self,
-		memory: &mut [u8],
+		memory: &mut M,
 		key_type: KeyType,
 		key_ptr: u32,
 		out_ptr: u32,
@@ -826,9 +847,9 @@ impl<'a, E: Ext + 'a> Runtime<'a, E> {
 		}
 	}
 
-	fn contains_storage(
+	fn contains_storage<M: Memory<E::T>>(
 		&mut self,
-		memory: &[u8],
+		memory: &M,
 		key_type: KeyType,
 		key_ptr: u32,
 	) -> Result<u32, TrapReason> {
@@ -840,9 +861,9 @@ impl<'a, E: Ext + 'a> Runtime<'a, E> {
 		Ok(outcome.unwrap_or(SENTINEL))
 	}
 
-	fn set_transient_storage(
+	fn set_transient_storage<M: Memory<E::T>>(
 		&mut self,
-		memory: &[u8],
+		memory: &mut M,
 		key_type: KeyType,
 		key_ptr: u32,
 		value_ptr: u32,
@@ -857,7 +878,7 @@ impl<'a, E: Ext + 'a> Runtime<'a, E> {
 			return Err(Error::<E::T>::ValueTooLarge.into())
 		}
 		let key = self.decode_key(memory, key_type, key_ptr)?;
-		let value = Some(self.read_sandbox_memory(memory, value_ptr, value_len)?);
+		let value = Some(memory.read(value_ptr, value_len)?);
 		let write_outcome = self.ext.set_transient_storage(&key, value, false)?;
 		self.adjust_gas(
 			charged,
@@ -869,9 +890,9 @@ impl<'a, E: Ext + 'a> Runtime<'a, E> {
 		Ok(write_outcome.old_len_with_sentinel())
 	}
 
-	fn clear_transient_storage(
+	fn clear_transient_storage<M: Memory<E::T>>(
 		&mut self,
-		memory: &[u8],
+		memory: &mut M,
 		key_type: KeyType,
 		key_ptr: u32,
 	) -> Result<u32, TrapReason> {
@@ -884,9 +905,9 @@ impl<'a, E: Ext + 'a> Runtime<'a, E> {
 		Ok(outcome.old_len_with_sentinel())
 	}
 
-	fn get_transient_storage(
+	fn get_transient_storage<M: Memory<E::T>>(
 		&mut self,
-		memory: &mut [u8],
+		memory: &mut M,
 		key_type: KeyType,
 		key_ptr: u32,
 		out_ptr: u32,
@@ -914,9 +935,9 @@ impl<'a, E: Ext + 'a> Runtime<'a, E> {
 		}
 	}
 
-	fn contains_transient_storage(
+	fn contains_transient_storage<M: Memory<E::T>>(
 		&mut self,
-		memory: &[u8],
+		memory: &mut M,
 		key_type: KeyType,
 		key_ptr: u32,
 	) -> Result<u32, TrapReason> {
@@ -929,9 +950,9 @@ impl<'a, E: Ext + 'a> Runtime<'a, E> {
 		Ok(outcome.unwrap_or(SENTINEL))
 	}
 
-	fn take_transient_storage(
+	fn take_transient_storage<M: Memory<E::T>>(
 		&mut self,
-		memory: &mut [u8],
+		memory: &mut M,
 		key_type: KeyType,
 		key_ptr: u32,
 		out_ptr: u32,
@@ -959,9 +980,9 @@ impl<'a, E: Ext + 'a> Runtime<'a, E> {
 		}
 	}
 
-	fn call(
+	fn call<M: Memory<E::T>>(
 		&mut self,
-		memory: &mut [u8],
+		memory: &mut M,
 		flags: CallFlags,
 		call_type: CallType,
 		input_data_ptr: u32,
@@ -979,21 +1000,20 @@ impl<'a, E: Ext + 'a> Runtime<'a, E> {
 			self.input_data.take().ok_or(Error::<E::T>::InputForwarded)?
 		} else {
 			self.charge_gas(RuntimeCosts::CopyFromContract(input_data_len))?;
-			self.read_sandbox_memory(memory, input_data_ptr, input_data_len)?
+			memory.read(input_data_ptr, input_data_len)?
 		};
 
 		let call_outcome = match call_type {
 			CallType::Call { callee_ptr, value_ptr, deposit_ptr, weight } => {
 				let callee: <<E as Ext>::T as frame_system::Config>::AccountId =
-					self.read_sandbox_memory_as(memory, callee_ptr)?;
+					memory.read_as(callee_ptr)?;
 				let deposit_limit: BalanceOf<<E as Ext>::T> = if deposit_ptr == SENTINEL {
 					BalanceOf::<<E as Ext>::T>::zero()
 				} else {
-					self.read_sandbox_memory_as(memory, deposit_ptr)?
+					memory.read_as(deposit_ptr)?
 				};
 				let read_only = flags.contains(CallFlags::READ_ONLY);
-				let value: BalanceOf<<E as Ext>::T> =
-					self.read_sandbox_memory_as(memory, value_ptr)?;
+				let value: BalanceOf<<E as Ext>::T> = memory.read_as(value_ptr)?;
 				if value > 0u32.into() {
 					// If the call value is non-zero and state change is not allowed, issue an
 					// error.
@@ -1016,7 +1036,7 @@ impl<'a, E: Ext + 'a> Runtime<'a, E> {
 				if flags.intersects(CallFlags::ALLOW_REENTRY | CallFlags::READ_ONLY) {
 					return Err(Error::<E::T>::InvalidCallFlags.into())
 				}
-				let code_hash = self.read_sandbox_memory_as(memory, code_hash_ptr)?;
+				let code_hash = memory.read_as(code_hash_ptr)?;
 				self.ext.delegate_call(code_hash, input_data)
 			},
 		};
@@ -1042,12 +1062,12 @@ impl<'a, E: Ext + 'a> Runtime<'a, E> {
 				|len| Some(RuntimeCosts::CopyToContract(len)),
 			)?;
 		}
-		Ok(Runtime::<E>::exec_into_return_code(call_outcome)?)
+		Ok(Self::exec_into_return_code(call_outcome)?)
 	}
 
-	fn instantiate(
+	fn instantiate<M: Memory<E::T>>(
 		&mut self,
-		memory: &mut [u8],
+		memory: &mut M,
 		code_hash_ptr: u32,
 		weight: Weight,
 		deposit_ptr: u32,
@@ -1065,13 +1085,12 @@ impl<'a, E: Ext + 'a> Runtime<'a, E> {
 		let deposit_limit: BalanceOf<<E as Ext>::T> = if deposit_ptr == SENTINEL {
 			BalanceOf::<<E as Ext>::T>::zero()
 		} else {
-			self.read_sandbox_memory_as(memory, deposit_ptr)?
+			memory.read_as(deposit_ptr)?
 		};
-		let value: BalanceOf<<E as Ext>::T> = self.read_sandbox_memory_as(memory, value_ptr)?;
-		let code_hash: CodeHash<<E as Ext>::T> =
-			self.read_sandbox_memory_as(memory, code_hash_ptr)?;
-		let input_data = self.read_sandbox_memory(memory, input_data_ptr, input_data_len)?;
-		let salt = self.read_sandbox_memory(memory, salt_ptr, salt_len)?;
+		let value: BalanceOf<<E as Ext>::T> = memory.read_as(value_ptr)?;
+		let code_hash: CodeHash<<E as Ext>::T> = memory.read_as(code_hash_ptr)?;
+		let input_data = memory.read(input_data_ptr, input_data_len)?;
+		let salt = memory.read(salt_ptr, salt_len)?;
 		let instantiate_outcome =
 			self.ext.instantiate(weight, deposit_limit, code_hash, value, input_data, &salt);
 		if let Ok((address, output)) = &instantiate_outcome {
@@ -1094,15 +1113,19 @@ impl<'a, E: Ext + 'a> Runtime<'a, E> {
 				|len| Some(RuntimeCosts::CopyToContract(len)),
 			)?;
 		}
-		Ok(Runtime::<E>::exec_into_return_code(instantiate_outcome.map(|(_, retval)| retval))?)
+		Ok(Self::exec_into_return_code(instantiate_outcome.map(|(_, retval)| retval))?)
 	}
 
-	fn terminate(&mut self, memory: &[u8], beneficiary_ptr: u32) -> Result<(), TrapReason> {
+	fn terminate<M: Memory<E::T>>(
+		&mut self,
+		memory: &M,
+		beneficiary_ptr: u32,
+	) -> Result<(), TrapReason> {
 		let count = self.ext.locked_delegate_dependencies_count() as _;
 		self.charge_gas(RuntimeCosts::Terminate(count))?;
 
 		let beneficiary: <<E as Ext>::T as frame_system::Config>::AccountId =
-			self.read_sandbox_memory_as(memory, beneficiary_ptr)?;
+			memory.read_as(beneficiary_ptr)?;
 		self.ext.terminate(&beneficiary)?;
 		Err(TrapReason::Termination)
 	}
@@ -1115,231 +1138,194 @@ impl<'a, E: Ext + 'a> Runtime<'a, E> {
 // Any input that leads to a out of bound error (reading or writing) or failing to decode
 // data passed to the supervisor will lead to a trap. This is not documented explicitly
 // for every function.
-#[define_env(doc)]
+#[define_env]
 pub mod env {
-
 	/// Noop function used to benchmark the time it takes to execute an empty function.
 	#[cfg(feature = "runtime-benchmarks")]
-	#[unstable]
-	fn noop(ctx: _, memory: _) -> Result<(), TrapReason> {
+	fn noop(&mut self, memory: &mut M) -> Result<(), TrapReason> {
 		Ok(())
 	}
 
 	/// Set the value at the given key in the contract storage.
-	/// See [`pallet_contracts_uapi::HostFn::set_storage`]
-	#[prefixed_alias]
-	#[mutating]
-	fn set_storage(
-		ctx: _,
-		memory: _,
-		key_ptr: u32,
-		value_ptr: u32,
-		value_len: u32,
-	) -> Result<(), TrapReason> {
-		ctx.set_storage(memory, KeyType::Fix, key_ptr, value_ptr, value_len).map(|_| ())
-	}
-
-	/// Set the value at the given key in the contract storage.
-	/// See [`pallet_contracts_uapi::HostFn::set_storage_v1`]
-	#[version(1)]
-	#[prefixed_alias]
-	#[mutating]
-	fn set_storage(
-		ctx: _,
-		memory: _,
-		key_ptr: u32,
-		value_ptr: u32,
-		value_len: u32,
-	) -> Result<u32, TrapReason> {
-		ctx.set_storage(memory, KeyType::Fix, key_ptr, value_ptr, value_len)
-	}
-
-	/// Set the value at the given key in the contract storage.
 	/// See [`pallet_contracts_uapi::HostFn::set_storage_v2`]
-	#[version(2)]
-	#[prefixed_alias]
+	#[api_version(0)]
 	#[mutating]
 	fn set_storage(
-		ctx: _,
-		memory: _,
+		&mut self,
+		memory: &mut M,
 		key_ptr: u32,
 		key_len: u32,
 		value_ptr: u32,
 		value_len: u32,
 	) -> Result<u32, TrapReason> {
-		ctx.set_storage(memory, KeyType::Var(key_len), key_ptr, value_ptr, value_len)
-	}
-
-	/// Clear the value at the given key in the contract storage.
-	/// See [`pallet_contracts_uapi::HostFn::clear_storage`]
-	#[prefixed_alias]
-	#[mutating]
-	fn clear_storage(ctx: _, memory: _, key_ptr: u32) -> Result<(), TrapReason> {
-		ctx.clear_storage(memory, KeyType::Fix, key_ptr).map(|_| ())
+		if key_len == SENTINEL {
+			self.set_storage(memory, KeyType::Fix, key_ptr, value_ptr, value_len)
+		} else {
+			self.set_storage(memory, KeyType::Var(key_len), key_ptr, value_ptr, value_len)
+		}
 	}
 
 	/// Clear the value at the given key in the contract storage.
 	/// See [`pallet_contracts_uapi::HostFn::clear_storage_v1`]
-	#[version(1)]
-	#[prefixed_alias]
+	#[api_version(0)]
 	#[mutating]
-	fn clear_storage(ctx: _, memory: _, key_ptr: u32, key_len: u32) -> Result<u32, TrapReason> {
-		ctx.clear_storage(memory, KeyType::Var(key_len), key_ptr)
-	}
-
-	/// Retrieve the value under the given key from storage.
-	/// See [`pallet_contracts_uapi::HostFn::get_storage`]
-	#[prefixed_alias]
-	fn get_storage(
-		ctx: _,
-		memory: _,
+	fn clear_storage(
+		&mut self,
+		memory: &mut M,
 		key_ptr: u32,
-		out_ptr: u32,
-		out_len_ptr: u32,
-	) -> Result<ReturnErrorCode, TrapReason> {
-		ctx.get_storage(memory, KeyType::Fix, key_ptr, out_ptr, out_len_ptr)
+		key_len: u32,
+	) -> Result<u32, TrapReason> {
+		if key_len == SENTINEL {
+			self.clear_storage(memory, KeyType::Fix, key_ptr)
+		} else {
+			self.clear_storage(memory, KeyType::Var(key_len), key_ptr)
+		}
 	}
 
 	/// Retrieve the value under the given key from storage.
 	/// See [`pallet_contracts_uapi::HostFn::get_storage_v1`]
-	#[version(1)]
-	#[prefixed_alias]
+	#[api_version(0)]
 	fn get_storage(
-		ctx: _,
-		memory: _,
+		&mut self,
+		memory: &mut M,
 		key_ptr: u32,
 		key_len: u32,
 		out_ptr: u32,
 		out_len_ptr: u32,
 	) -> Result<ReturnErrorCode, TrapReason> {
-		ctx.get_storage(memory, KeyType::Var(key_len), key_ptr, out_ptr, out_len_ptr)
-	}
-
-	/// Checks whether there is a value stored under the given key.
-	/// See [`pallet_contracts_uapi::HostFn::contains_storage`]
-	#[prefixed_alias]
-	fn contains_storage(ctx: _, memory: _, key_ptr: u32) -> Result<u32, TrapReason> {
-		ctx.contains_storage(memory, KeyType::Fix, key_ptr)
+		if key_len == SENTINEL {
+			self.get_storage(memory, KeyType::Fix, key_ptr, out_ptr, out_len_ptr)
+		} else {
+			self.get_storage(memory, KeyType::Var(key_len), key_ptr, out_ptr, out_len_ptr)
+		}
 	}
 
 	/// Checks whether there is a value stored under the given key.
 	/// See [`pallet_contracts_uapi::HostFn::contains_storage_v1`]
-	#[version(1)]
-	#[prefixed_alias]
-	fn contains_storage(ctx: _, memory: _, key_ptr: u32, key_len: u32) -> Result<u32, TrapReason> {
-		ctx.contains_storage(memory, KeyType::Var(key_len), key_ptr)
+	#[api_version(0)]
+	fn contains_storage(
+		&mut self,
+		memory: &mut M,
+		key_ptr: u32,
+		key_len: u32,
+	) -> Result<u32, TrapReason> {
+		if key_len == SENTINEL {
+			self.contains_storage(memory, KeyType::Fix, key_ptr)
+		} else {
+			self.contains_storage(memory, KeyType::Var(key_len), key_ptr)
+		}
 	}
 
 	/// Retrieve and remove the value under the given key from storage.
 	/// See [`pallet_contracts_uapi::HostFn::take_storage`]
-	#[prefixed_alias]
+	#[api_version(0)]
 	#[mutating]
 	fn take_storage(
-		ctx: _,
-		memory: _,
+		&mut self,
+		memory: &mut M,
 		key_ptr: u32,
 		key_len: u32,
 		out_ptr: u32,
 		out_len_ptr: u32,
 	) -> Result<ReturnErrorCode, TrapReason> {
-		let charged = ctx.charge_gas(RuntimeCosts::TakeStorage(ctx.ext.max_value_size()))?;
+		let charged = self.charge_gas(RuntimeCosts::TakeStorage(self.ext.max_value_size()))?;
 		ensure!(
 			key_len <= <<E as Ext>::T as Config>::MaxStorageKeyLen::get(),
 			Error::<E::T>::DecodingFailed
 		);
-		let key = ctx.read_sandbox_memory(memory, key_ptr, key_len)?;
-		if let crate::storage::WriteOutcome::Taken(value) = ctx.ext.set_storage(
+		let key = memory.read(key_ptr, key_len)?;
+		if let crate::storage::WriteOutcome::Taken(value) = self.ext.set_storage(
 			&Key::<E::T>::try_from_var(key).map_err(|_| Error::<E::T>::DecodingFailed)?,
 			None,
 			true,
 		)? {
-			ctx.adjust_gas(charged, RuntimeCosts::TakeStorage(value.len() as u32));
-			ctx.write_sandbox_output(memory, out_ptr, out_len_ptr, &value, false, already_charged)?;
+			self.adjust_gas(charged, RuntimeCosts::TakeStorage(value.len() as u32));
+			self.write_sandbox_output(
+				memory,
+				out_ptr,
+				out_len_ptr,
+				&value,
+				false,
+				already_charged,
+			)?;
 			Ok(ReturnErrorCode::Success)
 		} else {
-			ctx.adjust_gas(charged, RuntimeCosts::TakeStorage(0));
+			self.adjust_gas(charged, RuntimeCosts::TakeStorage(0));
 			Ok(ReturnErrorCode::KeyNotFound)
 		}
 	}
 
 	/// Set the value at the given key in the contract transient storage.
-	#[unstable]
 	fn set_transient_storage(
-		ctx: _,
-		memory: _,
+		&mut self,
+		memory: &mut M,
 		key_ptr: u32,
 		key_len: u32,
 		value_ptr: u32,
 		value_len: u32,
 	) -> Result<u32, TrapReason> {
-		ctx.set_transient_storage(memory, KeyType::Var(key_len), key_ptr, value_ptr, value_len)
+		self.set_transient_storage(memory, KeyType::Var(key_len), key_ptr, value_ptr, value_len)
 	}
 
 	/// Clear the value at the given key in the contract storage.
-	#[unstable]
 	fn clear_transient_storage(
-		ctx: _,
-		memory: _,
+		&mut self,
+		memory: &mut M,
 		key_ptr: u32,
 		key_len: u32,
 	) -> Result<u32, TrapReason> {
-		ctx.clear_transient_storage(memory, KeyType::Var(key_len), key_ptr)
+		self.clear_transient_storage(memory, KeyType::Var(key_len), key_ptr)
 	}
 
 	/// Retrieve the value under the given key from transient storage.
-	#[unstable]
 	fn get_transient_storage(
-		ctx: _,
-		memory: _,
+		&mut self,
+		memory: &mut M,
 		key_ptr: u32,
 		key_len: u32,
 		out_ptr: u32,
 		out_len_ptr: u32,
 	) -> Result<ReturnErrorCode, TrapReason> {
-		ctx.get_transient_storage(memory, KeyType::Var(key_len), key_ptr, out_ptr, out_len_ptr)
+		self.get_transient_storage(memory, KeyType::Var(key_len), key_ptr, out_ptr, out_len_ptr)
 	}
 
 	/// Checks whether there is a value stored under the given key in transient storage.
-	#[unstable]
 	fn contains_transient_storage(
-		ctx: _,
-		memory: _,
+		&mut self,
+		memory: &mut M,
 		key_ptr: u32,
 		key_len: u32,
 	) -> Result<u32, TrapReason> {
-		ctx.contains_transient_storage(memory, KeyType::Var(key_len), key_ptr)
+		self.contains_transient_storage(memory, KeyType::Var(key_len), key_ptr)
 	}
 
 	/// Retrieve and remove the value under the given key from transient storage.
-	#[unstable]
 	fn take_transient_storage(
-		ctx: _,
-		memory: _,
+		&mut self,
+		memory: &mut M,
 		key_ptr: u32,
 		key_len: u32,
 		out_ptr: u32,
 		out_len_ptr: u32,
 	) -> Result<ReturnErrorCode, TrapReason> {
-		ctx.take_transient_storage(memory, KeyType::Var(key_len), key_ptr, out_ptr, out_len_ptr)
+		self.take_transient_storage(memory, KeyType::Var(key_len), key_ptr, out_ptr, out_len_ptr)
 	}
 
 	/// Transfer some value to another account.
 	/// See [`pallet_contracts_uapi::HostFn::transfer`].
-	#[prefixed_alias]
+	#[api_version(0)]
 	#[mutating]
 	fn transfer(
-		ctx: _,
-		memory: _,
+		&mut self,
+		memory: &mut M,
 		account_ptr: u32,
-		_account_len: u32,
 		value_ptr: u32,
-		_value_len: u32,
 	) -> Result<ReturnErrorCode, TrapReason> {
-		ctx.charge_gas(RuntimeCosts::Transfer)?;
+		self.charge_gas(RuntimeCosts::Transfer)?;
 		let callee: <<E as Ext>::T as frame_system::Config>::AccountId =
-			ctx.read_sandbox_memory_as(memory, account_ptr)?;
-		let value: BalanceOf<<E as Ext>::T> = ctx.read_sandbox_memory_as(memory, value_ptr)?;
-		let result = ctx.ext.transfer(&callee, value);
+			memory.read_as(account_ptr)?;
+		let value: BalanceOf<<E as Ext>::T> = memory.read_as(value_ptr)?;
+		let result = self.ext.transfer(&callee, value);
 		match result {
 			Ok(()) => Ok(ReturnErrorCode::Success),
 			Err(err) => {
@@ -1350,80 +1336,11 @@ pub mod env {
 	}
 
 	/// Make a call to another contract.
-	///
-	/// # Note
-	///
-	/// The values `_callee_len` and `_value_len` are ignored because the encoded sizes of those
-	/// types are fixed through [`codec::MaxEncodedLen`]. The fields exist for backwards
-	/// compatibility. Consider switching to the newest version of this function.
-	#[prefixed_alias]
-	fn call(
-		ctx: _,
-		memory: _,
-		callee_ptr: u32,
-		_callee_len: u32,
-		gas: u64,
-		value_ptr: u32,
-		_value_len: u32,
-		input_data_ptr: u32,
-		input_data_len: u32,
-		output_ptr: u32,
-		output_len_ptr: u32,
-	) -> Result<ReturnErrorCode, TrapReason> {
-		ctx.call(
-			memory,
-			CallFlags::ALLOW_REENTRY,
-			CallType::Call {
-				callee_ptr,
-				value_ptr,
-				deposit_ptr: SENTINEL,
-				weight: Weight::from_parts(gas, 0),
-			},
-			input_data_ptr,
-			input_data_len,
-			output_ptr,
-			output_len_ptr,
-		)
-	}
-
-	/// Make a call to another contract.
-	/// See [`pallet_contracts_uapi::HostFn::call_v1`].
-	#[version(1)]
-	#[prefixed_alias]
-	fn call(
-		ctx: _,
-		memory: _,
-		flags: u32,
-		callee_ptr: u32,
-		gas: u64,
-		value_ptr: u32,
-		input_data_ptr: u32,
-		input_data_len: u32,
-		output_ptr: u32,
-		output_len_ptr: u32,
-	) -> Result<ReturnErrorCode, TrapReason> {
-		ctx.call(
-			memory,
-			CallFlags::from_bits(flags).ok_or(Error::<E::T>::InvalidCallFlags)?,
-			CallType::Call {
-				callee_ptr,
-				value_ptr,
-				deposit_ptr: SENTINEL,
-				weight: Weight::from_parts(gas, 0),
-			},
-			input_data_ptr,
-			input_data_len,
-			output_ptr,
-			output_len_ptr,
-		)
-	}
-
-	/// Make a call to another contract.
 	/// See [`pallet_contracts_uapi::HostFn::call_v2`].
-	#[version(2)]
+	#[api_version(0)]
 	fn call(
-		ctx: _,
-		memory: _,
+		&mut self,
+		memory: &mut M,
 		flags: u32,
 		callee_ptr: u32,
 		ref_time_limit: u64,
@@ -1435,7 +1352,7 @@ pub mod env {
 		output_ptr: u32,
 		output_len_ptr: u32,
 	) -> Result<ReturnErrorCode, TrapReason> {
-		ctx.call(
+		self.call(
 			memory,
 			CallFlags::from_bits(flags).ok_or(Error::<E::T>::InvalidCallFlags)?,
 			CallType::Call {
@@ -1453,10 +1370,10 @@ pub mod env {
 
 	/// Execute code in the context (storage, caller, value) of the current contract.
 	/// See [`pallet_contracts_uapi::HostFn::delegate_call`].
-	#[prefixed_alias]
+	#[api_version(0)]
 	fn delegate_call(
-		ctx: _,
-		memory: _,
+		&mut self,
+		memory: &mut M,
 		flags: u32,
 		code_hash_ptr: u32,
 		input_data_ptr: u32,
@@ -1464,7 +1381,7 @@ pub mod env {
 		output_ptr: u32,
 		output_len_ptr: u32,
 	) -> Result<ReturnErrorCode, TrapReason> {
-		ctx.call(
+		self.call(
 			memory,
 			CallFlags::from_bits(flags).ok_or(Error::<E::T>::InvalidCallFlags)?,
 			CallType::DelegateCall { code_hash_ptr },
@@ -1476,93 +1393,12 @@ pub mod env {
 	}
 
 	/// Instantiate a contract with the specified code hash.
-	/// See [`pallet_contracts_uapi::HostFn::instantiate`].
-	///
-	/// # Note
-	///
-	/// The values `_code_hash_len` and `_value_len` are ignored because the encoded sizes
-	/// of those types are fixed through [`codec::MaxEncodedLen`]. The fields exist
-	/// for backwards compatibility. Consider switching to the newest version of this function.
-	#[prefixed_alias]
-	#[mutating]
-	fn instantiate(
-		ctx: _,
-		memory: _,
-		code_hash_ptr: u32,
-		_code_hash_len: u32,
-		gas: u64,
-		value_ptr: u32,
-		_value_len: u32,
-		input_data_ptr: u32,
-		input_data_len: u32,
-		address_ptr: u32,
-		address_len_ptr: u32,
-		output_ptr: u32,
-		output_len_ptr: u32,
-		salt_ptr: u32,
-		salt_len: u32,
-	) -> Result<ReturnErrorCode, TrapReason> {
-		ctx.instantiate(
-			memory,
-			code_hash_ptr,
-			Weight::from_parts(gas, 0),
-			SENTINEL,
-			value_ptr,
-			input_data_ptr,
-			input_data_len,
-			address_ptr,
-			address_len_ptr,
-			output_ptr,
-			output_len_ptr,
-			salt_ptr,
-			salt_len,
-		)
-	}
-
-	/// Instantiate a contract with the specified code hash.
-	/// See [`pallet_contracts_uapi::HostFn::instantiate_v1`].
-	#[version(1)]
-	#[prefixed_alias]
-	#[mutating]
-	fn instantiate(
-		ctx: _,
-		memory: _,
-		code_hash_ptr: u32,
-		gas: u64,
-		value_ptr: u32,
-		input_data_ptr: u32,
-		input_data_len: u32,
-		address_ptr: u32,
-		address_len_ptr: u32,
-		output_ptr: u32,
-		output_len_ptr: u32,
-		salt_ptr: u32,
-		salt_len: u32,
-	) -> Result<ReturnErrorCode, TrapReason> {
-		ctx.instantiate(
-			memory,
-			code_hash_ptr,
-			Weight::from_parts(gas, 0),
-			SENTINEL,
-			value_ptr,
-			input_data_ptr,
-			input_data_len,
-			address_ptr,
-			address_len_ptr,
-			output_ptr,
-			output_len_ptr,
-			salt_ptr,
-			salt_len,
-		)
-	}
-
-	/// Instantiate a contract with the specified code hash.
 	/// See [`pallet_contracts_uapi::HostFn::instantiate_v2`].
-	#[version(2)]
+	#[api_version(0)]
 	#[mutating]
 	fn instantiate(
-		ctx: _,
-		memory: _,
+		&mut self,
+		memory: &mut M,
 		code_hash_ptr: u32,
 		ref_time_limit: u64,
 		proof_size_limit: u64,
@@ -1577,7 +1413,7 @@ pub mod env {
 		salt_ptr: u32,
 		salt_len: u32,
 	) -> Result<ReturnErrorCode, TrapReason> {
-		ctx.instantiate(
+		self.instantiate(
 			memory,
 			code_hash_ptr,
 			Weight::from_parts(ref_time_limit, proof_size_limit),
@@ -1594,43 +1430,23 @@ pub mod env {
 		)
 	}
 
-	/// Remove the calling account and transfer remaining balance.
-	/// See [`pallet_contracts_uapi::HostFn::terminate`].
-	///
-	/// # Note
-	///
-	/// The value `_beneficiary_len` is ignored because the encoded sizes
-	/// this type is fixed through `[`MaxEncodedLen`]. The field exist for backwards
-	/// compatibility. Consider switching to the newest version of this function.
-	#[prefixed_alias]
-	#[mutating]
-	fn terminate(
-		ctx: _,
-		memory: _,
-		beneficiary_ptr: u32,
-		_beneficiary_len: u32,
-	) -> Result<(), TrapReason> {
-		ctx.terminate(memory, beneficiary_ptr)
-	}
-
 	/// Remove the calling account and transfer remaining **free** balance.
 	/// See [`pallet_contracts_uapi::HostFn::terminate_v1`].
-	#[version(1)]
-	#[prefixed_alias]
+	#[api_version(0)]
 	#[mutating]
-	fn terminate(ctx: _, memory: _, beneficiary_ptr: u32) -> Result<(), TrapReason> {
-		ctx.terminate(memory, beneficiary_ptr)
+	fn terminate(&mut self, memory: &mut M, beneficiary_ptr: u32) -> Result<(), TrapReason> {
+		self.terminate(memory, beneficiary_ptr)
 	}
 
 	/// Stores the input passed by the caller into the supplied buffer.
 	/// See [`pallet_contracts_uapi::HostFn::input`].
-	#[prefixed_alias]
-	fn input(ctx: _, memory: _, out_ptr: u32, out_len_ptr: u32) -> Result<(), TrapReason> {
-		if let Some(input) = ctx.input_data.take() {
-			ctx.write_sandbox_output(memory, out_ptr, out_len_ptr, &input, false, |len| {
+	#[api_version(0)]
+	fn input(&mut self, memory: &mut M, out_ptr: u32, out_len_ptr: u32) -> Result<(), TrapReason> {
+		if let Some(input) = self.input_data.take() {
+			self.write_sandbox_output(memory, out_ptr, out_len_ptr, &input, false, |len| {
 				Some(RuntimeCosts::CopyToContract(len))
 			})?;
-			ctx.input_data = Some(input);
+			self.input_data = Some(input);
 			Ok(())
 		} else {
 			Err(Error::<E::T>::InputForwarded.into())
@@ -1639,27 +1455,25 @@ pub mod env {
 
 	/// Cease contract execution and save a data buffer as a result of the execution.
 	/// See [`pallet_contracts_uapi::HostFn::return_value`].
+	#[api_version(0)]
 	fn seal_return(
-		ctx: _,
-		memory: _,
+		&mut self,
+		memory: &mut M,
 		flags: u32,
 		data_ptr: u32,
 		data_len: u32,
 	) -> Result<(), TrapReason> {
-		ctx.charge_gas(RuntimeCosts::CopyFromContract(data_len))?;
-		Err(TrapReason::Return(ReturnData {
-			flags,
-			data: ctx.read_sandbox_memory(memory, data_ptr, data_len)?,
-		}))
+		self.charge_gas(RuntimeCosts::CopyFromContract(data_len))?;
+		Err(TrapReason::Return(ReturnData { flags, data: memory.read(data_ptr, data_len)? }))
 	}
 
 	/// Stores the address of the caller into the supplied buffer.
 	/// See [`pallet_contracts_uapi::HostFn::caller`].
-	#[prefixed_alias]
-	fn caller(ctx: _, memory: _, out_ptr: u32, out_len_ptr: u32) -> Result<(), TrapReason> {
-		ctx.charge_gas(RuntimeCosts::Caller)?;
-		let caller = ctx.ext.caller().account_id()?.clone();
-		Ok(ctx.write_sandbox_output(
+	#[api_version(0)]
+	fn caller(&mut self, memory: &mut M, out_ptr: u32, out_len_ptr: u32) -> Result<(), TrapReason> {
+		self.charge_gas(RuntimeCosts::Caller)?;
+		let caller = self.ext.caller().account_id()?.clone();
+		Ok(self.write_sandbox_output(
 			memory,
 			out_ptr,
 			out_len_ptr,
@@ -1671,30 +1485,30 @@ pub mod env {
 
 	/// Checks whether a specified address belongs to a contract.
 	/// See [`pallet_contracts_uapi::HostFn::is_contract`].
-	#[prefixed_alias]
-	fn is_contract(ctx: _, memory: _, account_ptr: u32) -> Result<u32, TrapReason> {
-		ctx.charge_gas(RuntimeCosts::IsContract)?;
+	#[api_version(0)]
+	fn is_contract(&mut self, memory: &mut M, account_ptr: u32) -> Result<u32, TrapReason> {
+		self.charge_gas(RuntimeCosts::IsContract)?;
 		let address: <<E as Ext>::T as frame_system::Config>::AccountId =
-			ctx.read_sandbox_memory_as(memory, account_ptr)?;
+			memory.read_as(account_ptr)?;
 
-		Ok(ctx.ext.is_contract(&address) as u32)
+		Ok(self.ext.is_contract(&address) as u32)
 	}
 
 	/// Retrieve the code hash for a specified contract address.
 	/// See [`pallet_contracts_uapi::HostFn::code_hash`].
-	#[prefixed_alias]
+	#[api_version(0)]
 	fn code_hash(
-		ctx: _,
-		memory: _,
+		&mut self,
+		memory: &mut M,
 		account_ptr: u32,
 		out_ptr: u32,
 		out_len_ptr: u32,
 	) -> Result<ReturnErrorCode, TrapReason> {
-		ctx.charge_gas(RuntimeCosts::CodeHash)?;
+		self.charge_gas(RuntimeCosts::CodeHash)?;
 		let address: <<E as Ext>::T as frame_system::Config>::AccountId =
-			ctx.read_sandbox_memory_as(memory, account_ptr)?;
-		if let Some(value) = ctx.ext.code_hash(&address) {
-			ctx.write_sandbox_output(
+			memory.read_as(account_ptr)?;
+		if let Some(value) = self.ext.code_hash(&address) {
+			self.write_sandbox_output(
 				memory,
 				out_ptr,
 				out_len_ptr,
@@ -1710,11 +1524,16 @@ pub mod env {
 
 	/// Retrieve the code hash of the currently executing contract.
 	/// See [`pallet_contracts_uapi::HostFn::own_code_hash`].
-	#[prefixed_alias]
-	fn own_code_hash(ctx: _, memory: _, out_ptr: u32, out_len_ptr: u32) -> Result<(), TrapReason> {
-		ctx.charge_gas(RuntimeCosts::OwnCodeHash)?;
-		let code_hash_encoded = &ctx.ext.own_code_hash().encode();
-		Ok(ctx.write_sandbox_output(
+	#[api_version(0)]
+	fn own_code_hash(
+		&mut self,
+		memory: &mut M,
+		out_ptr: u32,
+		out_len_ptr: u32,
+	) -> Result<(), TrapReason> {
+		self.charge_gas(RuntimeCosts::OwnCodeHash)?;
+		let code_hash_encoded = &self.ext.own_code_hash().encode();
+		Ok(self.write_sandbox_output(
 			memory,
 			out_ptr,
 			out_len_ptr,
@@ -1726,29 +1545,35 @@ pub mod env {
 
 	/// Checks whether the caller of the current contract is the origin of the whole call stack.
 	/// See [`pallet_contracts_uapi::HostFn::caller_is_origin`].
-	#[prefixed_alias]
-	fn caller_is_origin(ctx: _, _memory: _) -> Result<u32, TrapReason> {
-		ctx.charge_gas(RuntimeCosts::CallerIsOrigin)?;
-		Ok(ctx.ext.caller_is_origin() as u32)
+	#[api_version(0)]
+	fn caller_is_origin(&mut self, _memory: &mut M) -> Result<u32, TrapReason> {
+		self.charge_gas(RuntimeCosts::CallerIsOrigin)?;
+		Ok(self.ext.caller_is_origin() as u32)
 	}
 
 	/// Checks whether the caller of the current contract is root.
 	/// See [`pallet_contracts_uapi::HostFn::caller_is_root`].
-	fn caller_is_root(ctx: _, _memory: _) -> Result<u32, TrapReason> {
-		ctx.charge_gas(RuntimeCosts::CallerIsRoot)?;
-		Ok(ctx.ext.caller_is_root() as u32)
+	#[api_version(0)]
+	fn caller_is_root(&mut self, _memory: &mut M) -> Result<u32, TrapReason> {
+		self.charge_gas(RuntimeCosts::CallerIsRoot)?;
+		Ok(self.ext.caller_is_root() as u32)
 	}
 
 	/// Stores the address of the current contract into the supplied buffer.
 	/// See [`pallet_contracts_uapi::HostFn::address`].
-	#[prefixed_alias]
-	fn address(ctx: _, memory: _, out_ptr: u32, out_len_ptr: u32) -> Result<(), TrapReason> {
-		ctx.charge_gas(RuntimeCosts::Address)?;
-		Ok(ctx.write_sandbox_output(
+	#[api_version(0)]
+	fn address(
+		&mut self,
+		memory: &mut M,
+		out_ptr: u32,
+		out_len_ptr: u32,
+	) -> Result<(), TrapReason> {
+		self.charge_gas(RuntimeCosts::Address)?;
+		Ok(self.write_sandbox_output(
 			memory,
 			out_ptr,
 			out_len_ptr,
-			&ctx.ext.address().encode(),
+			&self.ext.address().encode(),
 			false,
 			already_charged,
 		)?)
@@ -1756,21 +1581,21 @@ pub mod env {
 
 	/// Stores the price for the specified amount of gas into the supplied buffer.
 	/// See [`pallet_contracts_uapi::HostFn::weight_to_fee`].
-	#[prefixed_alias]
-	fn weight_to_fee(
-		ctx: _,
-		memory: _,
+	#[api_version(0)]
+	fn weight_to_fee_reftime(
+		&mut self,
+		memory: &mut M,
 		gas: u64,
 		out_ptr: u32,
 		out_len_ptr: u32,
 	) -> Result<(), TrapReason> {
 		let gas = Weight::from_parts(gas, 0);
-		ctx.charge_gas(RuntimeCosts::WeightToFee)?;
-		Ok(ctx.write_sandbox_output(
+		self.charge_gas(RuntimeCosts::WeightToFee)?;
+		Ok(self.write_sandbox_output(
 			memory,
 			out_ptr,
 			out_len_ptr,
-			&ctx.ext.get_weight_price(gas).encode(),
+			&self.ext.get_weight_price(gas).encode(),
 			false,
 			already_charged,
 		)?)
@@ -1778,23 +1603,21 @@ pub mod env {
 
 	/// Stores the price for the specified amount of weight into the supplied buffer.
 	/// See [`pallet_contracts_uapi::HostFn::weight_to_fee_v1`].
-	#[version(1)]
-	#[unstable]
-	fn weight_to_fee(
-		ctx: _,
-		memory: _,
+	fn weight_to_fee_full(
+		&mut self,
+		memory: &mut M,
 		ref_time_limit: u64,
 		proof_size_limit: u64,
 		out_ptr: u32,
 		out_len_ptr: u32,
 	) -> Result<(), TrapReason> {
 		let weight = Weight::from_parts(ref_time_limit, proof_size_limit);
-		ctx.charge_gas(RuntimeCosts::WeightToFee)?;
-		Ok(ctx.write_sandbox_output(
+		self.charge_gas(RuntimeCosts::WeightToFee)?;
+		Ok(self.write_sandbox_output(
 			memory,
 			out_ptr,
 			out_len_ptr,
-			&ctx.ext.get_weight_price(weight).encode(),
+			&self.ext.get_weight_price(weight).encode(),
 			false,
 			already_charged,
 		)?)
@@ -1802,11 +1625,16 @@ pub mod env {
 
 	/// Stores the weight left into the supplied buffer.
 	/// See [`pallet_contracts_uapi::HostFn::gas_left`].
-	#[prefixed_alias]
-	fn gas_left(ctx: _, memory: _, out_ptr: u32, out_len_ptr: u32) -> Result<(), TrapReason> {
-		ctx.charge_gas(RuntimeCosts::GasLeft)?;
-		let gas_left = &ctx.ext.gas_meter().gas_left().ref_time().encode();
-		Ok(ctx.write_sandbox_output(
+	#[api_version(0)]
+	fn gas_left_reftime(
+		&mut self,
+		memory: &mut M,
+		out_ptr: u32,
+		out_len_ptr: u32,
+	) -> Result<(), TrapReason> {
+		self.charge_gas(RuntimeCosts::GasLeft)?;
+		let gas_left = &self.ext.gas_meter().gas_left().ref_time().encode();
+		Ok(self.write_sandbox_output(
 			memory,
 			out_ptr,
 			out_len_ptr,
@@ -1818,12 +1646,15 @@ pub mod env {
 
 	/// Stores the amount of weight left into the supplied buffer.
 	/// See [`pallet_contracts_uapi::HostFn::gas_left_v1`].
-	#[version(1)]
-	#[unstable]
-	fn gas_left(ctx: _, memory: _, out_ptr: u32, out_len_ptr: u32) -> Result<(), TrapReason> {
-		ctx.charge_gas(RuntimeCosts::GasLeft)?;
-		let gas_left = &ctx.ext.gas_meter().gas_left().encode();
-		Ok(ctx.write_sandbox_output(
+	fn gas_left_full(
+		&mut self,
+		memory: &mut M,
+		out_ptr: u32,
+		out_len_ptr: u32,
+	) -> Result<(), TrapReason> {
+		self.charge_gas(RuntimeCosts::GasLeft)?;
+		let gas_left = &self.ext.gas_meter().gas_left().encode();
+		Ok(self.write_sandbox_output(
 			memory,
 			out_ptr,
 			out_len_ptr,
@@ -1835,14 +1666,19 @@ pub mod env {
 
 	/// Stores the *free* balance of the current account into the supplied buffer.
 	/// See [`pallet_contracts_uapi::HostFn::balance`].
-	#[prefixed_alias]
-	fn balance(ctx: _, memory: _, out_ptr: u32, out_len_ptr: u32) -> Result<(), TrapReason> {
-		ctx.charge_gas(RuntimeCosts::Balance)?;
-		Ok(ctx.write_sandbox_output(
+	#[api_version(0)]
+	fn balance(
+		&mut self,
+		memory: &mut M,
+		out_ptr: u32,
+		out_len_ptr: u32,
+	) -> Result<(), TrapReason> {
+		self.charge_gas(RuntimeCosts::Balance)?;
+		Ok(self.write_sandbox_output(
 			memory,
 			out_ptr,
 			out_len_ptr,
-			&ctx.ext.balance().encode(),
+			&self.ext.balance().encode(),
 			false,
 			already_charged,
 		)?)
@@ -1850,99 +1686,19 @@ pub mod env {
 
 	/// Stores the value transferred along with this call/instantiate into the supplied buffer.
 	/// See [`pallet_contracts_uapi::HostFn::value_transferred`].
-	#[prefixed_alias]
+	#[api_version(0)]
 	fn value_transferred(
-		ctx: _,
-		memory: _,
+		&mut self,
+		memory: &mut M,
 		out_ptr: u32,
 		out_len_ptr: u32,
 	) -> Result<(), TrapReason> {
-		ctx.charge_gas(RuntimeCosts::ValueTransferred)?;
-		Ok(ctx.write_sandbox_output(
+		self.charge_gas(RuntimeCosts::ValueTransferred)?;
+		Ok(self.write_sandbox_output(
 			memory,
 			out_ptr,
 			out_len_ptr,
-			&ctx.ext.value_transferred().encode(),
-			false,
-			already_charged,
-		)?)
-	}
-
-	/// Stores a random number for the current block and the given subject into the supplied buffer.
-	///
-	/// The value is stored to linear memory at the address pointed to by `out_ptr`.
-	/// `out_len_ptr` must point to a u32 value that describes the available space at
-	/// `out_ptr`. This call overwrites it with the size of the value. If the available
-	/// space at `out_ptr` is less than the size of the value a trap is triggered.
-	///
-	/// The data is encoded as `T::Hash`.
-	#[prefixed_alias]
-	#[deprecated]
-	fn random(
-		ctx: _,
-		memory: _,
-		subject_ptr: u32,
-		subject_len: u32,
-		out_ptr: u32,
-		out_len_ptr: u32,
-	) -> Result<(), TrapReason> {
-		ctx.charge_gas(RuntimeCosts::Random)?;
-		if subject_len > ctx.ext.schedule().limits.subject_len {
-			return Err(Error::<E::T>::RandomSubjectTooLong.into())
-		}
-		let subject_buf = ctx.read_sandbox_memory(memory, subject_ptr, subject_len)?;
-		Ok(ctx.write_sandbox_output(
-			memory,
-			out_ptr,
-			out_len_ptr,
-			&ctx.ext.random(&subject_buf).0.encode(),
-			false,
-			already_charged,
-		)?)
-	}
-
-	/// Stores a random number for the current block and the given subject into the supplied buffer.
-	///
-	/// The value is stored to linear memory at the address pointed to by `out_ptr`.
-	/// `out_len_ptr` must point to a u32 value that describes the available space at
-	/// `out_ptr`. This call overwrites it with the size of the value. If the available
-	/// space at `out_ptr` is less than the size of the value a trap is triggered.
-	///
-	/// The data is encoded as (T::Hash, frame_system::pallet_prelude::BlockNumberFor::<T>).
-	///
-	/// # Changes from v0
-	///
-	/// In addition to the seed it returns the block number since which it was determinable
-	/// by chain observers.
-	///
-	/// # Note
-	///
-	/// The returned seed should only be used to distinguish commitments made before
-	/// the returned block number. If the block number is too early (i.e. commitments were
-	/// made afterwards), then ensure no further commitments may be made and repeatedly
-	/// call this on later blocks until the block number returned is later than the latest
-	/// commitment.
-	#[version(1)]
-	#[prefixed_alias]
-	#[deprecated]
-	fn random(
-		ctx: _,
-		memory: _,
-		subject_ptr: u32,
-		subject_len: u32,
-		out_ptr: u32,
-		out_len_ptr: u32,
-	) -> Result<(), TrapReason> {
-		ctx.charge_gas(RuntimeCosts::Random)?;
-		if subject_len > ctx.ext.schedule().limits.subject_len {
-			return Err(Error::<E::T>::RandomSubjectTooLong.into())
-		}
-		let subject_buf = ctx.read_sandbox_memory(memory, subject_ptr, subject_len)?;
-		Ok(ctx.write_sandbox_output(
-			memory,
-			out_ptr,
-			out_len_ptr,
-			&ctx.ext.random(&subject_buf).encode(),
+			&self.ext.value_transferred().encode(),
 			false,
 			already_charged,
 		)?)
@@ -1950,14 +1706,14 @@ pub mod env {
 
 	/// Load the latest block timestamp into the supplied buffer
 	/// See [`pallet_contracts_uapi::HostFn::now`].
-	#[prefixed_alias]
-	fn now(ctx: _, memory: _, out_ptr: u32, out_len_ptr: u32) -> Result<(), TrapReason> {
-		ctx.charge_gas(RuntimeCosts::Now)?;
-		Ok(ctx.write_sandbox_output(
+	#[api_version(0)]
+	fn now(&mut self, memory: &mut M, out_ptr: u32, out_len_ptr: u32) -> Result<(), TrapReason> {
+		self.charge_gas(RuntimeCosts::Now)?;
+		Ok(self.write_sandbox_output(
 			memory,
 			out_ptr,
 			out_len_ptr,
-			&ctx.ext.now().encode(),
+			&self.ext.now().encode(),
 			false,
 			already_charged,
 		)?)
@@ -1965,148 +1721,19 @@ pub mod env {
 
 	/// Stores the minimum balance (a.k.a. existential deposit) into the supplied buffer.
 	/// See [`pallet_contracts_uapi::HostFn::minimum_balance`].
-	#[prefixed_alias]
+	#[api_version(0)]
 	fn minimum_balance(
-		ctx: _,
-		memory: _,
+		&mut self,
+		memory: &mut M,
 		out_ptr: u32,
 		out_len_ptr: u32,
 	) -> Result<(), TrapReason> {
-		ctx.charge_gas(RuntimeCosts::MinimumBalance)?;
-		Ok(ctx.write_sandbox_output(
+		self.charge_gas(RuntimeCosts::MinimumBalance)?;
+		Ok(self.write_sandbox_output(
 			memory,
 			out_ptr,
 			out_len_ptr,
-			&ctx.ext.minimum_balance().encode(),
-			false,
-			already_charged,
-		)?)
-	}
-
-	/// Stores the tombstone deposit into the supplied buffer.
-	///
-	/// The value is stored to linear memory at the address pointed to by `out_ptr`.
-	/// `out_len_ptr` must point to a u32 value that describes the available space at
-	/// `out_ptr`. This call overwrites it with the size of the value. If the available
-	/// space at `out_ptr` is less than the size of the value a trap is triggered.
-	///
-	/// # Note
-	///
-	/// There is no longer a tombstone deposit. This function always returns `0`.
-	#[prefixed_alias]
-	#[deprecated]
-	fn tombstone_deposit(
-		ctx: _,
-		memory: _,
-		out_ptr: u32,
-		out_len_ptr: u32,
-	) -> Result<(), TrapReason> {
-		ctx.charge_gas(RuntimeCosts::Balance)?;
-		let deposit = <BalanceOf<E::T>>::zero().encode();
-		Ok(ctx.write_sandbox_output(
-			memory,
-			out_ptr,
-			out_len_ptr,
-			&deposit,
-			false,
-			already_charged,
-		)?)
-	}
-
-	/// Was used to restore the given destination contract sacrificing the caller.
-	///
-	/// # Note
-	///
-	/// The state rent functionality was removed. This is stub only exists for
-	/// backwards compatibility
-	#[prefixed_alias]
-	#[deprecated]
-	fn restore_to(
-		ctx: _,
-		memory: _,
-		_dest_ptr: u32,
-		_dest_len: u32,
-		_code_hash_ptr: u32,
-		_code_hash_len: u32,
-		_rent_allowance_ptr: u32,
-		_rent_allowance_len: u32,
-		_delta_ptr: u32,
-		_delta_count: u32,
-	) -> Result<(), TrapReason> {
-		ctx.charge_gas(RuntimeCosts::DebugMessage(0))?;
-		Ok(())
-	}
-
-	/// Was used to restore the given destination contract sacrificing the caller.
-	///
-	/// # Note
-	///
-	/// The state rent functionality was removed. This is stub only exists for
-	/// backwards compatibility
-	#[version(1)]
-	#[prefixed_alias]
-	#[deprecated]
-	fn restore_to(
-		ctx: _,
-		memory: _,
-		_dest_ptr: u32,
-		_code_hash_ptr: u32,
-		_rent_allowance_ptr: u32,
-		_delta_ptr: u32,
-		_delta_count: u32,
-	) -> Result<(), TrapReason> {
-		ctx.charge_gas(RuntimeCosts::DebugMessage(0))?;
-		Ok(())
-	}
-
-	/// Was used to set rent allowance of the contract.
-	///
-	/// # Note
-	///
-	/// The state rent functionality was removed. This is stub only exists for
-	/// backwards compatibility.
-	#[prefixed_alias]
-	#[deprecated]
-	fn set_rent_allowance(
-		ctx: _,
-		memory: _,
-		_value_ptr: u32,
-		_value_len: u32,
-	) -> Result<(), TrapReason> {
-		ctx.charge_gas(RuntimeCosts::DebugMessage(0))?;
-		Ok(())
-	}
-
-	/// Was used to set rent allowance of the contract.
-	///
-	/// # Note
-	///
-	/// The state rent functionality was removed. This is stub only exists for
-	/// backwards compatibility.
-	#[version(1)]
-	#[prefixed_alias]
-	#[deprecated]
-	fn set_rent_allowance(ctx: _, _memory: _, _value_ptr: u32) -> Result<(), TrapReason> {
-		ctx.charge_gas(RuntimeCosts::DebugMessage(0))?;
-		Ok(())
-	}
-
-	/// Was used to store the rent allowance into the supplied buffer.
-	///
-	/// # Note
-	///
-	/// The state rent functionality was removed. This is stub only exists for
-	/// backwards compatibility.
-	#[prefixed_alias]
-	#[deprecated]
-	fn rent_allowance(ctx: _, memory: _, out_ptr: u32, out_len_ptr: u32) -> Result<(), TrapReason> {
-		ctx.charge_gas(RuntimeCosts::Balance)?;
-		let rent_allowance = <BalanceOf<E::T>>::max_value().encode();
-		Ok(ctx.write_sandbox_output(
-			memory,
-			out_ptr,
-			out_len_ptr,
-			&rent_allowance,
+			&self.ext.minimum_balance().encode(),
 			false,
 			already_charged,
 		)?)
@@ -2114,11 +1741,11 @@ pub mod env {
 
 	/// Deposit a contract event with the data buffer and optional list of topics.
 	/// See [pallet_contracts_uapi::HostFn::deposit_event]
-	#[prefixed_alias]
+	#[api_version(0)]
 	#[mutating]
 	fn deposit_event(
-		ctx: _,
-		memory: _,
+		&mut self,
+		memory: &mut M,
 		topics_ptr: u32,
 		topics_len: u32,
 		data_ptr: u32,
@@ -2127,38 +1754,43 @@ pub mod env {
 		let num_topic = topics_len
 			.checked_div(core::mem::size_of::<TopicOf<E::T>>() as u32)
 			.ok_or("Zero sized topics are not allowed")?;
-		ctx.charge_gas(RuntimeCosts::DepositEvent { num_topic, len: data_len })?;
-		if data_len > ctx.ext.max_value_size() {
-			return Err(Error::<E::T>::ValueTooLarge.into())
+		self.charge_gas(RuntimeCosts::DepositEvent { num_topic, len: data_len })?;
+		if data_len > self.ext.max_value_size() {
+			return Err(Error::<E::T>::ValueTooLarge.into());
 		}
 
 		let topics: Vec<TopicOf<<E as Ext>::T>> = match topics_len {
 			0 => Vec::new(),
-			_ => ctx.read_sandbox_memory_as_unbounded(memory, topics_ptr, topics_len)?,
+			_ => memory.read_as_unbounded(topics_ptr, topics_len)?,
 		};
 
 		// If there are more than `event_topics`, then trap.
-		if topics.len() > ctx.ext.schedule().limits.event_topics as usize {
-			return Err(Error::<E::T>::TooManyTopics.into())
+		if topics.len() > self.ext.schedule().limits.event_topics as usize {
+			return Err(Error::<E::T>::TooManyTopics.into());
 		}
 
-		let event_data = ctx.read_sandbox_memory(memory, data_ptr, data_len)?;
+		let event_data = memory.read(data_ptr, data_len)?;
 
-		ctx.ext.deposit_event(topics, event_data);
+		self.ext.deposit_event(topics, event_data);
 
 		Ok(())
 	}
 
 	/// Stores the current block number of the current contract into the supplied buffer.
 	/// See [`pallet_contracts_uapi::HostFn::block_number`].
-	#[prefixed_alias]
-	fn block_number(ctx: _, memory: _, out_ptr: u32, out_len_ptr: u32) -> Result<(), TrapReason> {
-		ctx.charge_gas(RuntimeCosts::BlockNumber)?;
-		Ok(ctx.write_sandbox_output(
+	#[api_version(0)]
+	fn block_number(
+		&mut self,
+		memory: &mut M,
+		out_ptr: u32,
+		out_len_ptr: u32,
+	) -> Result<(), TrapReason> {
+		self.charge_gas(RuntimeCosts::BlockNumber)?;
+		Ok(self.write_sandbox_output(
 			memory,
 			out_ptr,
 			out_len_ptr,
-			&ctx.ext.block_number().encode(),
+			&self.ext.block_number().encode(),
 			false,
 			already_charged,
 		)?)
@@ -2166,74 +1798,73 @@ pub mod env {
 
 	/// Computes the SHA2 256-bit hash on the given input buffer.
 	/// See [`pallet_contracts_uapi::HostFn::hash_sha2_256`].
-	#[prefixed_alias]
+	#[api_version(0)]
 	fn hash_sha2_256(
-		ctx: _,
-		memory: _,
+		&mut self,
+		memory: &mut M,
 		input_ptr: u32,
 		input_len: u32,
 		output_ptr: u32,
 	) -> Result<(), TrapReason> {
-		ctx.charge_gas(RuntimeCosts::HashSha256(input_len))?;
-		Ok(ctx.compute_hash_on_intermediate_buffer(
+		self.charge_gas(RuntimeCosts::HashSha256(input_len))?;
+		Ok(self.compute_hash_on_intermediate_buffer(
 			memory, sha2_256, input_ptr, input_len, output_ptr,
 		)?)
 	}
 
 	/// Computes the KECCAK 256-bit hash on the given input buffer.
 	/// See [`pallet_contracts_uapi::HostFn::hash_keccak_256`].
-	#[prefixed_alias]
+	#[api_version(0)]
 	fn hash_keccak_256(
-		ctx: _,
-		memory: _,
+		&mut self,
+		memory: &mut M,
 		input_ptr: u32,
 		input_len: u32,
 		output_ptr: u32,
 	) -> Result<(), TrapReason> {
-		ctx.charge_gas(RuntimeCosts::HashKeccak256(input_len))?;
-		Ok(ctx.compute_hash_on_intermediate_buffer(
+		self.charge_gas(RuntimeCosts::HashKeccak256(input_len))?;
+		Ok(self.compute_hash_on_intermediate_buffer(
 			memory, keccak_256, input_ptr, input_len, output_ptr,
 		)?)
 	}
 
 	/// Computes the BLAKE2 256-bit hash on the given input buffer.
 	/// See [`pallet_contracts_uapi::HostFn::hash_blake2_256`].
-	#[prefixed_alias]
+	#[api_version(0)]
 	fn hash_blake2_256(
-		ctx: _,
-		memory: _,
+		&mut self,
+		memory: &mut M,
 		input_ptr: u32,
 		input_len: u32,
 		output_ptr: u32,
 	) -> Result<(), TrapReason> {
-		ctx.charge_gas(RuntimeCosts::HashBlake256(input_len))?;
-		Ok(ctx.compute_hash_on_intermediate_buffer(
+		self.charge_gas(RuntimeCosts::HashBlake256(input_len))?;
+		Ok(self.compute_hash_on_intermediate_buffer(
 			memory, blake2_256, input_ptr, input_len, output_ptr,
 		)?)
 	}
 
 	/// Computes the BLAKE2 128-bit hash on the given input buffer.
 	/// See [`pallet_contracts_uapi::HostFn::hash_blake2_128`].
-	#[prefixed_alias]
+	#[api_version(0)]
 	fn hash_blake2_128(
-		ctx: _,
-		memory: _,
+		&mut self,
+		memory: &mut M,
 		input_ptr: u32,
 		input_len: u32,
 		output_ptr: u32,
 	) -> Result<(), TrapReason> {
-		ctx.charge_gas(RuntimeCosts::HashBlake128(input_len))?;
-		Ok(ctx.compute_hash_on_intermediate_buffer(
+		self.charge_gas(RuntimeCosts::HashBlake128(input_len))?;
+		Ok(self.compute_hash_on_intermediate_buffer(
 			memory, blake2_128, input_ptr, input_len, output_ptr,
 		)?)
 	}
 
 	/// Call into the chain extension provided by the chain if any.
 	/// See [`pallet_contracts_uapi::HostFn::call_chain_extension`].
-	#[prefixed_alias]
 	fn call_chain_extension(
-		ctx: _,
-		memory: _,
+		&mut self,
+		memory: &mut M,
 		id: u32,
 		input_ptr: u32,
 		input_len: u32,
@@ -2242,20 +1873,20 @@ pub mod env {
 	) -> Result<u32, TrapReason> {
 		use crate::chain_extension::{ChainExtension, Environment, RetVal};
 		if !<E::T as Config>::ChainExtension::enabled() {
-			return Err(Error::<E::T>::NoChainExtension.into())
+			return Err(Error::<E::T>::NoChainExtension.into());
 		}
-		let mut chain_extension = ctx.chain_extension.take().expect(
-			"Constructor initializes with `Some`. This is the only place where it is set to `None`.\
-			It is always reset to `Some` afterwards. qed"
-		);
+		let mut chain_extension = self.chain_extension.take().expect(
+            "Constructor initializes with `Some`. This is the only place where it is set to `None`.\
+			It is always reset to `Some` afterwards. qed",
+        );
 		let env =
-			Environment::new(ctx, memory, id, input_ptr, input_len, output_ptr, output_len_ptr);
+			Environment::new(self, memory, id, input_ptr, input_len, output_ptr, output_len_ptr);
 		let ret = match chain_extension.call(env)? {
 			RetVal::Converging(val) => Ok(val),
 			RetVal::Diverging { flags, data } =>
 				Err(TrapReason::Return(ReturnData { flags: flags.bits(), data })),
 		};
-		ctx.chain_extension = Some(chain_extension);
+		self.chain_extension = Some(chain_extension);
 		ret
 	}
 
@@ -2276,19 +1907,19 @@ pub mod env {
 	/// not being executed as an RPC. For example, they could allow users to disable logging
 	/// through compile time flags (cargo features) for on-chain deployment. Additionally, the
 	/// return value of this function can be cached in order to prevent further calls at runtime.
-	#[prefixed_alias]
+	#[api_version(0)]
 	fn debug_message(
-		ctx: _,
-		memory: _,
+		&mut self,
+		memory: &mut M,
 		str_ptr: u32,
 		str_len: u32,
 	) -> Result<ReturnErrorCode, TrapReason> {
 		let str_len = str_len.min(DebugBufferVec::<E::T>::bound() as u32);
-		ctx.charge_gas(RuntimeCosts::DebugMessage(str_len))?;
-		if ctx.ext.append_debug_buffer("") {
-			let data = ctx.read_sandbox_memory(memory, str_ptr, str_len)?;
+		self.charge_gas(RuntimeCosts::DebugMessage(str_len))?;
+		if self.ext.append_debug_buffer("") {
+			let data = memory.read(str_ptr, str_len)?;
 			if let Some(msg) = core::str::from_utf8(&data).ok() {
-				ctx.ext.append_debug_buffer(msg);
+				self.ext.append_debug_buffer(msg);
 			}
 		}
 		Ok(ReturnErrorCode::Success)
@@ -2298,19 +1929,18 @@ pub mod env {
 	/// See [`frame_support::traits::call_runtime`].
 	#[mutating]
 	fn call_runtime(
-		ctx: _,
-		memory: _,
+		&mut self,
+		memory: &mut M,
 		call_ptr: u32,
 		call_len: u32,
 	) -> Result<ReturnErrorCode, TrapReason> {
 		use frame_support::dispatch::GetDispatchInfo;
-		ctx.charge_gas(RuntimeCosts::CopyFromContract(call_len))?;
-		let call: <E::T as Config>::RuntimeCall =
-			ctx.read_sandbox_memory_as_unbounded(memory, call_ptr, call_len)?;
-		ctx.call_dispatchable::<CallRuntimeFailed>(
+		self.charge_gas(RuntimeCosts::CopyFromContract(call_len))?;
+		let call: <E::T as Config>::RuntimeCall = memory.read_as_unbounded(call_ptr, call_len)?;
+		self.call_dispatchable::<CallRuntimeFailed>(
 			call.get_dispatch_info(),
 			RuntimeCosts::CallRuntime,
-			|ctx| ctx.ext.call_runtime(call),
+			|runtime| runtime.ext.call_runtime(call),
 		)
 	}
 
@@ -2318,8 +1948,8 @@ pub mod env {
 	/// See [`pallet_contracts_uapi::HostFn::execute_xcm`].
 	#[mutating]
 	fn xcm_execute(
-		ctx: _,
-		memory: _,
+		&mut self,
+		memory: &mut M,
 		msg_ptr: u32,
 		msg_len: u32,
 	) -> Result<ReturnErrorCode, TrapReason> {
@@ -2327,20 +1957,19 @@ pub mod env {
 		use xcm::VersionedXcm;
 		use xcm_builder::{ExecuteController, ExecuteControllerWeightInfo};
 
-		ctx.charge_gas(RuntimeCosts::CopyFromContract(msg_len))?;
-		let message: VersionedXcm<CallOf<E::T>> =
-			ctx.read_sandbox_memory_as_unbounded(memory, msg_ptr, msg_len)?;
+		self.charge_gas(RuntimeCosts::CopyFromContract(msg_len))?;
+		let message: VersionedXcm<CallOf<E::T>> = memory.read_as_unbounded(msg_ptr, msg_len)?;
 
 		let execute_weight =
 			<<E::T as Config>::Xcm as ExecuteController<_, _>>::WeightInfo::execute();
-		let weight = ctx.ext.gas_meter().gas_left().max(execute_weight);
+		let weight = self.ext.gas_meter().gas_left().max(execute_weight);
 		let dispatch_info = DispatchInfo { weight, ..Default::default() };
 
-		ctx.call_dispatchable::<XcmExecutionFailed>(
+		self.call_dispatchable::<XcmExecutionFailed>(
 			dispatch_info,
 			RuntimeCosts::CallXcmExecute,
-			|ctx| {
-				let origin = crate::RawOrigin::Signed(ctx.ext.address().clone()).into();
+			|runtime| {
+				let origin = crate::RawOrigin::Signed(runtime.ext.address().clone()).into();
 				let weight_used = <<E::T as Config>::Xcm>::execute(
 					origin,
 					Box::new(message),
@@ -2356,8 +1985,8 @@ pub mod env {
 	/// See [`pallet_contracts_uapi::HostFn::send_xcm`].
 	#[mutating]
 	fn xcm_send(
-		ctx: _,
-		memory: _,
+		&mut self,
+		memory: &mut M,
 		dest_ptr: u32,
 		msg_ptr: u32,
 		msg_len: u32,
@@ -2366,24 +1995,23 @@ pub mod env {
 		use xcm::{VersionedLocation, VersionedXcm};
 		use xcm_builder::{SendController, SendControllerWeightInfo};
 
-		ctx.charge_gas(RuntimeCosts::CopyFromContract(msg_len))?;
-		let dest: VersionedLocation = ctx.read_sandbox_memory_as(memory, dest_ptr)?;
+		self.charge_gas(RuntimeCosts::CopyFromContract(msg_len))?;
+		let dest: VersionedLocation = memory.read_as(dest_ptr)?;
 
-		let message: VersionedXcm<()> =
-			ctx.read_sandbox_memory_as_unbounded(memory, msg_ptr, msg_len)?;
+		let message: VersionedXcm<()> = memory.read_as_unbounded(msg_ptr, msg_len)?;
 		let weight = <<E::T as Config>::Xcm as SendController<_>>::WeightInfo::send();
-		ctx.charge_gas(RuntimeCosts::CallRuntime(weight))?;
-		let origin = crate::RawOrigin::Signed(ctx.ext.address().clone()).into();
+		self.charge_gas(RuntimeCosts::CallRuntime(weight))?;
+		let origin = crate::RawOrigin::Signed(self.ext.address().clone()).into();
 
 		match <<E::T as Config>::Xcm>::send(origin, dest.into(), message.into()) {
 			Ok(message_id) => {
-				ctx.write_sandbox_memory(memory, output_ptr, &message_id.encode())?;
+				memory.write(output_ptr, &message_id.encode())?;
 				Ok(ReturnErrorCode::Success)
 			},
 			Err(e) => {
-				if ctx.ext.append_debug_buffer("") {
-					ctx.ext.append_debug_buffer("seal0::xcm_send failed with: ");
-					ctx.ext.append_debug_buffer(e.into());
+				if self.ext.append_debug_buffer("") {
+					self.ext.append_debug_buffer("seal0::xcm_send failed with: ");
+					self.ext.append_debug_buffer(e.into());
 				};
 				Ok(ReturnErrorCode::XcmSendFailed)
 			},
@@ -2392,28 +2020,28 @@ pub mod env {
 
 	/// Recovers the ECDSA public key from the given message hash and signature.
 	/// See [`pallet_contracts_uapi::HostFn::ecdsa_recover`].
-	#[prefixed_alias]
+	#[api_version(0)]
 	fn ecdsa_recover(
-		ctx: _,
-		memory: _,
+		&mut self,
+		memory: &mut M,
 		signature_ptr: u32,
 		message_hash_ptr: u32,
 		output_ptr: u32,
 	) -> Result<ReturnErrorCode, TrapReason> {
-		ctx.charge_gas(RuntimeCosts::EcdsaRecovery)?;
+		self.charge_gas(RuntimeCosts::EcdsaRecovery)?;
 
 		let mut signature: [u8; 65] = [0; 65];
-		ctx.read_sandbox_memory_into_buf(memory, signature_ptr, &mut signature)?;
+		memory.read_into_buf(signature_ptr, &mut signature)?;
 		let mut message_hash: [u8; 32] = [0; 32];
-		ctx.read_sandbox_memory_into_buf(memory, message_hash_ptr, &mut message_hash)?;
+		memory.read_into_buf(message_hash_ptr, &mut message_hash)?;
 
-		let result = ctx.ext.ecdsa_recover(&signature, &message_hash);
+		let result = self.ext.ecdsa_recover(&signature, &message_hash);
 
 		match result {
 			Ok(pub_key) => {
 				// Write the recovered compressed ecdsa public key back into the sandboxed output
 				// buffer.
-				ctx.write_sandbox_memory(memory, output_ptr, pub_key.as_ref())?;
+				memory.write(output_ptr, pub_key.as_ref())?;
 
 				Ok(ReturnErrorCode::Success)
 			},
@@ -2423,25 +2051,26 @@ pub mod env {
 
 	/// Verify a sr25519 signature
 	/// See [`pallet_contracts_uapi::HostFn::sr25519_verify`].
+	#[api_version(0)]
 	fn sr25519_verify(
-		ctx: _,
-		memory: _,
+		&mut self,
+		memory: &mut M,
 		signature_ptr: u32,
 		pub_key_ptr: u32,
 		message_len: u32,
 		message_ptr: u32,
 	) -> Result<ReturnErrorCode, TrapReason> {
-		ctx.charge_gas(RuntimeCosts::Sr25519Verify(message_len))?;
+		self.charge_gas(RuntimeCosts::Sr25519Verify(message_len))?;
 
 		let mut signature: [u8; 64] = [0; 64];
-		ctx.read_sandbox_memory_into_buf(memory, signature_ptr, &mut signature)?;
+		memory.read_into_buf(signature_ptr, &mut signature)?;
 
 		let mut pub_key: [u8; 32] = [0; 32];
-		ctx.read_sandbox_memory_into_buf(memory, pub_key_ptr, &mut pub_key)?;
+		memory.read_into_buf(pub_key_ptr, &mut pub_key)?;
 
-		let message: Vec<u8> = ctx.read_sandbox_memory(memory, message_ptr, message_len)?;
+		let message: Vec<u8> = memory.read(message_ptr, message_len)?;
 
-		if ctx.ext.sr25519_verify(&signature, &message, &pub_key) {
+		if self.ext.sr25519_verify(&signature, &message, &pub_key) {
 			Ok(ReturnErrorCode::Success)
 		} else {
 			Ok(ReturnErrorCode::Sr25519VerifyFailed)
@@ -2450,13 +2079,16 @@ pub mod env {
 
 	/// Replace the contract code at the specified address with new code.
 	/// See [`pallet_contracts_uapi::HostFn::set_code_hash`].
-	#[prefixed_alias]
+	#[api_version(0)]
 	#[mutating]
-	fn set_code_hash(ctx: _, memory: _, code_hash_ptr: u32) -> Result<ReturnErrorCode, TrapReason> {
-		ctx.charge_gas(RuntimeCosts::SetCodeHash)?;
-		let code_hash: CodeHash<<E as Ext>::T> =
-			ctx.read_sandbox_memory_as(memory, code_hash_ptr)?;
-		match ctx.ext.set_code_hash(code_hash) {
+	fn set_code_hash(
+		&mut self,
+		memory: &mut M,
+		code_hash_ptr: u32,
+	) -> Result<ReturnErrorCode, TrapReason> {
+		self.charge_gas(RuntimeCosts::SetCodeHash)?;
+		let code_hash: CodeHash<<E as Ext>::T> = memory.read_as(code_hash_ptr)?;
+		match self.ext.set_code_hash(code_hash) {
 			Err(err) => {
 				let code = Runtime::<E>::err_into_return_code(err)?;
 				Ok(code)
@@ -2467,70 +2099,53 @@ pub mod env {
 
 	/// Calculates Ethereum address from the ECDSA compressed public key and stores
 	/// See [`pallet_contracts_uapi::HostFn::ecdsa_to_eth_address`].
-	#[prefixed_alias]
+	#[api_version(0)]
 	fn ecdsa_to_eth_address(
-		ctx: _,
-		memory: _,
+		&mut self,
+		memory: &mut M,
 		key_ptr: u32,
 		out_ptr: u32,
 	) -> Result<ReturnErrorCode, TrapReason> {
-		ctx.charge_gas(RuntimeCosts::EcdsaToEthAddress)?;
+		self.charge_gas(RuntimeCosts::EcdsaToEthAddress)?;
 		let mut compressed_key: [u8; 33] = [0; 33];
-		ctx.read_sandbox_memory_into_buf(memory, key_ptr, &mut compressed_key)?;
-		let result = ctx.ext.ecdsa_to_eth_address(&compressed_key);
+		memory.read_into_buf(key_ptr, &mut compressed_key)?;
+		let result = self.ext.ecdsa_to_eth_address(&compressed_key);
 		match result {
 			Ok(eth_address) => {
-				ctx.write_sandbox_memory(memory, out_ptr, eth_address.as_ref())?;
+				memory.write(out_ptr, eth_address.as_ref())?;
 				Ok(ReturnErrorCode::Success)
 			},
 			Err(_) => Ok(ReturnErrorCode::EcdsaRecoveryFailed),
 		}
 	}
 
-	/// Returns the number of times the currently executing contract exists on the call stack in
-	/// addition to the calling instance.
-	/// See [`pallet_contracts_uapi::HostFn::reentrance_count`].
-	#[unstable]
-	fn reentrance_count(ctx: _, memory: _) -> Result<u32, TrapReason> {
-		ctx.charge_gas(RuntimeCosts::ReentranceCount)?;
-		Ok(ctx.ext.reentrance_count())
-	}
-
-	/// Returns the number of times specified contract exists on the call stack. Delegated calls are
-	/// not counted as separate calls.
-	/// See [`pallet_contracts_uapi::HostFn::account_reentrance_count`].
-	#[unstable]
-	fn account_reentrance_count(ctx: _, memory: _, account_ptr: u32) -> Result<u32, TrapReason> {
-		ctx.charge_gas(RuntimeCosts::AccountReentranceCount)?;
-		let account_id: <<E as Ext>::T as frame_system::Config>::AccountId =
-			ctx.read_sandbox_memory_as(memory, account_ptr)?;
-		Ok(ctx.ext.account_reentrance_count(&account_id))
-	}
-
-	/// Returns a nonce that is unique per contract instantiation.
-	/// See [`pallet_contracts_uapi::HostFn::instantiation_nonce`].
-	fn instantiation_nonce(ctx: _, _memory: _) -> Result<u64, TrapReason> {
-		ctx.charge_gas(RuntimeCosts::InstantiationNonce)?;
-		Ok(ctx.ext.nonce())
-	}
-
 	/// Adds a new delegate dependency to the contract.
 	/// See [`pallet_contracts_uapi::HostFn::lock_delegate_dependency`].
+	#[api_version(0)]
 	#[mutating]
-	fn lock_delegate_dependency(ctx: _, memory: _, code_hash_ptr: u32) -> Result<(), TrapReason> {
-		ctx.charge_gas(RuntimeCosts::LockDelegateDependency)?;
-		let code_hash = ctx.read_sandbox_memory_as(memory, code_hash_ptr)?;
-		ctx.ext.lock_delegate_dependency(code_hash)?;
+	fn lock_delegate_dependency(
+		&mut self,
+		memory: &mut M,
+		code_hash_ptr: u32,
+	) -> Result<(), TrapReason> {
+		self.charge_gas(RuntimeCosts::LockDelegateDependency)?;
+		let code_hash = memory.read_as(code_hash_ptr)?;
+		self.ext.lock_delegate_dependency(code_hash)?;
 		Ok(())
 	}
 
 	/// Removes the delegate dependency from the contract.
 	/// see [`pallet_contracts_uapi::HostFn::unlock_delegate_dependency`].
+	#[api_version(0)]
 	#[mutating]
-	fn unlock_delegate_dependency(ctx: _, memory: _, code_hash_ptr: u32) -> Result<(), TrapReason> {
-		ctx.charge_gas(RuntimeCosts::UnlockDelegateDependency)?;
-		let code_hash = ctx.read_sandbox_memory_as(memory, code_hash_ptr)?;
-		ctx.ext.unlock_delegate_dependency(&code_hash)?;
+	fn unlock_delegate_dependency(
+		&mut self,
+		memory: &mut M,
+		code_hash_ptr: u32,
+	) -> Result<(), TrapReason> {
+		self.charge_gas(RuntimeCosts::UnlockDelegateDependency)?;
+		let code_hash = memory.read_as(code_hash_ptr)?;
+		self.ext.unlock_delegate_dependency(&code_hash)?;
 		Ok(())
 	}
 }

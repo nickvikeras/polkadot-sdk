@@ -27,7 +27,7 @@ where
 	T: frame_system::Config,
 {
 	let out_dir: PathBuf = env!("OUT_DIR").into();
-	let fixture_path = out_dir.join(format!("{fixture_name}.wasm"));
+	let fixture_path = out_dir.join(format!("{fixture_name}.polkavm"));
 	let binary = fs::read(fixture_path)?;
 	let code_hash = T::Hashing::hash(&binary);
 	Ok((binary, code_hash))
@@ -38,8 +38,6 @@ mod test {
 	#[test]
 	fn out_dir_should_have_compiled_mocks() {
 		let out_dir: std::path::PathBuf = env!("OUT_DIR").into();
-		assert!(out_dir.join("dummy.wasm").exists());
-		#[cfg(feature = "riscv")]
 		assert!(out_dir.join("dummy.polkavm").exists());
 	}
 }

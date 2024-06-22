@@ -20,20 +20,13 @@
 
 mod call_builder;
 mod code;
-mod sandbox;
 use self::{
 	call_builder::CallSetup,
-	code::{body, ImportedMemory, Location, ModuleDefinition, WasmModule},
-	sandbox::Sandbox,
+	code::{Location, WasmModule},
 };
 use crate::{
-	exec::{Key, SeedOf},
-	migration::{
-		codegen::LATEST_MIGRATION_VERSION, v09, v10, v11, v12, v13, v14, v15, v16, MigrationStep,
-	},
-	storage::WriteOutcome,
-	wasm::BenchEnv,
-	Pallet as Contracts, *,
+	exec::Key, migration::codegen::LATEST_MIGRATION_VERSION, storage::WriteOutcome,
+	wasm::MappedMemory, Pallet as Contracts, *,
 };
 use alloc::{vec, vec::Vec};
 use codec::{Encode, MaxEncodedLen};
@@ -48,7 +41,6 @@ use frame_system::RawOrigin;
 use pallet_balances;
 use pallet_contracts_uapi::{CallFlags, ReturnErrorCode};
 use sp_runtime::traits::{Bounded, Hash};
-use wasm_instrument::parity_wasm::elements::{Instruction, Local, ValueType};
 
 /// How many runs we do per API benchmark.
 ///
@@ -100,19 +92,20 @@ where
 		let value = Pallet::<T>::min_balance();
 		T::Currency::set_balance(&caller, caller_funding::<T>());
 		let salt = vec![0xff];
-		let addr = Contracts::<T>::contract_address(&caller, &module.hash, &data, &salt);
 
-		Contracts::<T>::store_code_raw(module.code, caller.clone())?;
-		Contracts::<T>::instantiate(
-			RawOrigin::Signed(caller.clone()).into(),
+		let outcome = Contracts::<T>::bare_instantiate(
+			caller.clone(),
 			value,
 			Weight::MAX,
 			None,
-			module.hash,
+			Code::Upload(module.code),
 			data,
 			salt,
-		)?;
+			DebugInfo::Skip,
+			CollectEvents::Skip,
+		);
 
+		let addr = outcome.result?.account_id;
 		let result =
 			Contract { caller, account_id: addr.clone(), addr: T::Lookup::unlookup(addr), value };
 
@@ -221,135 +214,6 @@ mod benchmarks {
 		Ok(())
 	}
 
-	// This benchmarks the v9 migration step (update codeStorage).
-	#[benchmark(pov_mode = Measured)]
-	fn v9_migration_step(c: Linear<0, { T::MaxCodeLen::get() }>) {
-		v09::store_old_dummy_code::<T>(c as usize);
-		let mut m = v09::Migration::<T>::default();
-		#[block]
-		{
-			m.step(&mut WeightMeter::new());
-		}
-	}
-
-	// This benchmarks the v10 migration step (use dedicated deposit_account).
-	#[benchmark(pov_mode = Measured)]
-	fn v10_migration_step() -> Result<(), BenchmarkError> {
-		let contract =
-			<Contract<T>>::with_caller(whitelisted_caller(), WasmModule::dummy(), vec![])?;
-
-		v10::store_old_contract_info::<T, pallet_balances::Pallet<T>>(
-			contract.account_id.clone(),
-			contract.info()?,
-		);
-		let mut m = v10::Migration::<T, pallet_balances::Pallet<T>>::default();
-
-		#[block]
-		{
-			m.step(&mut WeightMeter::new());
-		}
-
-		Ok(())
-	}
-
-	// This benchmarks the v11 migration step (Don't rely on reserved balances keeping an account
-	// alive).
-	#[benchmark(pov_mode = Measured)]
-	fn v11_migration_step(k: Linear<0, 1024>) {
-		v11::fill_old_queue::<T>(k as usize);
-		let mut m = v11::Migration::<T>::default();
-
-		#[block]
-		{
-			m.step(&mut WeightMeter::new());
-		}
-	}
-
-	// This benchmarks the v12 migration step (Move `OwnerInfo` to `CodeInfo`,
-	// add `determinism` field to the latter, clear `CodeStorage`
-	// and repay deposits).
-	#[benchmark(pov_mode = Measured)]
-	fn v12_migration_step(c: Linear<0, { T::MaxCodeLen::get() }>) {
-		v12::store_old_dummy_code::<T, pallet_balances::Pallet<T>>(
-			c as usize,
-			account::<T::AccountId>("account", 0, 0),
-		);
-		let mut m = v12::Migration::<T, pallet_balances::Pallet<T>>::default();
-
-		#[block]
-		{
-			m.step(&mut WeightMeter::new());
-		}
-	}
-
-	// This benchmarks the v13 migration step (Add delegate_dependencies field).
-	#[benchmark(pov_mode = Measured)]
-	fn v13_migration_step() -> Result<(), BenchmarkError> {
-		let contract =
-			<Contract<T>>::with_caller(whitelisted_caller(), WasmModule::dummy(), vec![])?;
-
-		v13::store_old_contract_info::<T>(contract.account_id.clone(), contract.info()?);
-		let mut m = v13::Migration::<T>::default();
-
-		#[block]
-		{
-			m.step(&mut WeightMeter::new());
-		}
-		Ok(())
-	}
-
-	// This benchmarks the v14 migration step (Move code owners' reserved balance to be held
-	// instead).
-	#[benchmark(pov_mode = Measured)]
-	fn v14_migration_step() {
-		let account = account::<T::AccountId>("account", 0, 0);
-		T::Currency::set_balance(&account, caller_funding::<T>());
-		v14::store_dummy_code::<T, pallet_balances::Pallet<T>>(account);
-		let mut m = v14::Migration::<T, pallet_balances::Pallet<T>>::default();
-
-		#[block]
-		{
-			m.step(&mut WeightMeter::new());
-		}
-	}
-
-	// This benchmarks the v15 migration step (remove deposit account).
-	#[benchmark(pov_mode = Measured)]
-	fn v15_migration_step() -> Result<(), BenchmarkError> {
-		let contract =
-			<Contract<T>>::with_caller(whitelisted_caller(), WasmModule::dummy(), vec![])?;
-
-		v15::store_old_contract_info::<T>(contract.account_id.clone(), contract.info()?);
-		let mut m = v15::Migration::<T>::default();
-
-		#[block]
-		{
-			m.step(&mut WeightMeter::new());
-		}
-
-		Ok(())
-	}
-
-	// This benchmarks the v16 migration step (Remove ED from base_deposit).
-	#[benchmark(pov_mode = Measured)]
-	fn v16_migration_step() -> Result<(), BenchmarkError> {
-		let contract =
-			<Contract<T>>::with_caller(whitelisted_caller(), WasmModule::dummy(), vec![])?;
-
-		let info = contract.info()?;
-		let base_deposit = v16::store_old_contract_info::<T>(contract.account_id.clone(), &info);
-		let mut m = v16::Migration::<T>::default();
-
-		#[block]
-		{
-			m.step(&mut WeightMeter::new());
-		}
-		let ed = Pallet::<T>::min_balance();
-		let info = v16::ContractInfoOf::<T>::get(&contract.account_id).unwrap();
-		assert_eq!(info.storage_base_deposit, base_deposit - ed);
-		Ok(())
-	}
-
 	// This benchmarks the weight of executing Migration::migrate to execute a noop migration.
 	#[benchmark(pov_mode = Measured)]
 	fn migration_noop() {
@@ -418,7 +282,7 @@ mod benchmarks {
 	}
 
 	// This benchmarks the overhead of loading a code of size `c` byte from storage and into
-	// the sandbox. This does **not** include the actual execution for which the gas meter
+	// the execution engine. This does **not** include the actual execution for which the gas meter
 	// is responsible. This is achieved by generating all code to the `deploy` function
 	// which is in the wasm module but not executed on `call`.
 	// The results are supposed to be used as `call_with_code_per_byte(c) -
@@ -486,9 +350,9 @@ mod benchmarks {
 		let value = Pallet::<T>::min_balance();
 		let caller = whitelisted_caller();
 		T::Currency::set_balance(&caller, caller_funding::<T>());
-		let WasmModule { code, hash, .. } = WasmModule::<T>::dummy();
+		let WasmModule { code, .. } = WasmModule::<T>::dummy();
+		let hash = Contracts::<T>::bare_upload_code(caller.clone(), code, None)?.code_hash;
 		let addr = Contracts::<T>::contract_address(&caller, &hash, &input, &salt);
-		Contracts::<T>::store_code_raw(code, caller.clone())?;
 
 		#[extrinsic_call]
 		_(RawOrigin::Signed(caller.clone()), value, Weight::MAX, None, hash, input, salt);
@@ -545,33 +409,16 @@ mod benchmarks {
 	// It creates a maximum number of metering blocks per byte.
 	// `c`: Size of the code in bytes.
 	#[benchmark(pov_mode = Measured)]
-	fn upload_code_determinism_enforced(c: Linear<0, { T::MaxCodeLen::get() }>) {
+	fn upload_code(c: Linear<0, { T::MaxCodeLen::get() }>) {
 		let caller = whitelisted_caller();
 		T::Currency::set_balance(&caller, caller_funding::<T>());
 		let WasmModule { code, hash, .. } = WasmModule::<T>::sized(c, Location::Call, false);
 		let origin = RawOrigin::Signed(caller.clone());
 		#[extrinsic_call]
-		upload_code(origin, code, None, Determinism::Enforced);
+		_(origin, code, None);
 		// uploading the code reserves some balance in the callers account
 		assert!(T::Currency::total_balance_on_hold(&caller) > 0u32.into());
 		assert!(<Contract<T>>::code_exists(&hash));
-	}
-
-	// Uploading code with [`Determinism::Relaxed`] should be more expensive than uploading code
-	// with [`Determinism::Enforced`], as we always try to save the code with
-	// [`Determinism::Enforced`] first.
-	#[benchmark(pov_mode = Measured)]
-	fn upload_code_determinism_relaxed(c: Linear<0, { T::MaxCodeLen::get() }>) {
-		let caller = whitelisted_caller();
-		T::Currency::set_balance(&caller, caller_funding::<T>());
-		let WasmModule { code, hash, .. } = WasmModule::<T>::sized(c, Location::Call, true);
-		let origin = RawOrigin::Signed(caller.clone());
-		#[extrinsic_call]
-		upload_code(origin, code, None, Determinism::Relaxed);
-		assert!(T::Currency::total_balance_on_hold(&caller) > 0u32.into());
-		assert!(<Contract<T>>::code_exists(&hash));
-		// Ensure that the benchmark follows the most expensive path, i.e., the code is saved with
-		assert_eq!(CodeInfoOf::<T>::get(&hash).unwrap().determinism(), Determinism::Relaxed);
 	}
 
 	// Removing code does not depend on the size of the contract because all the information
@@ -583,8 +430,7 @@ mod benchmarks {
 		T::Currency::set_balance(&caller, caller_funding::<T>());
 		let WasmModule { code, hash, .. } = WasmModule::<T>::dummy();
 		let origin = RawOrigin::Signed(caller.clone());
-		let uploaded =
-			<Contracts<T>>::bare_upload_code(caller.clone(), code, None, Determinism::Enforced)?;
+		let uploaded = <Contracts<T>>::bare_upload_code(caller.clone(), code, None)?;
 		assert_eq!(uploaded.code_hash, hash);
 		assert_eq!(uploaded.deposit, T::Currency::total_balance_on_hold(&caller));
 		assert!(<Contract<T>>::code_exists(&hash));
@@ -601,8 +447,8 @@ mod benchmarks {
 		let instance =
 			<Contract<T>>::with_caller(whitelisted_caller(), WasmModule::dummy(), vec![])?;
 		// we just add some bytes so that the code hash is different
-		let WasmModule { code, hash, .. } = <WasmModule<T>>::dummy_with_bytes(128);
-		<Contracts<T>>::store_code_raw(code, instance.caller.clone())?;
+		let WasmModule { code, .. } = <WasmModule<T>>::dummy_with_bytes(128);
+		let hash = <Contracts<T>>::bare_upload_code(instance.caller.clone(), code, None)?.code_hash;
 		let callee = instance.addr.clone();
 		assert_ne!(instance.info()?.code_hash, hash);
 		#[extrinsic_call]
@@ -615,10 +461,10 @@ mod benchmarks {
 	fn noop_host_fn(r: Linear<0, API_BENCHMARK_RUNS>) {
 		let mut setup = CallSetup::<T>::new(WasmModule::noop(r));
 		let (mut ext, module) = setup.ext();
-		let func = CallSetup::<T>::prepare_call(&mut ext, module, vec![]);
+		let prepared = CallSetup::<T>::prepare_call(&mut ext, module, vec![]);
 		#[block]
 		{
-			func.call();
+			prepared.call().unwrap();
 		}
 	}
 
@@ -630,7 +476,7 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_caller(&mut runtime, &mut memory, 4, 0);
+			result = runtime.bench_caller(&mut MappedMemory::new(memory.as_mut()), 4, 0);
 		}
 
 		assert_ok!(result);
@@ -650,7 +496,7 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_is_contract(&mut runtime, &mut memory, 0);
+			result = runtime.bench_is_contract(&mut MappedMemory::new(&mut memory), 0);
 		}
 
 		assert_eq!(result.unwrap(), 1);
@@ -665,7 +511,7 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_code_hash(&mut runtime, &mut memory, 4 + len, 4, 0);
+			result = runtime.bench_code_hash(&mut MappedMemory::new(&mut memory), 4 + len, 4, 0);
 		}
 
 		assert_ok!(result);
@@ -682,7 +528,7 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_own_code_hash(&mut runtime, &mut memory, 4, 0);
+			result = runtime.bench_own_code_hash(&mut MappedMemory::new(&mut memory), 4, 0);
 		}
 
 		assert_ok!(result);
@@ -699,7 +545,7 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_caller_is_origin(&mut runtime, &mut memory);
+			result = runtime.bench_caller_is_origin(&mut MappedMemory::new(&mut memory));
 		}
 		assert_eq!(result.unwrap(), 1u32);
 	}
@@ -714,7 +560,7 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_caller_is_root(&mut runtime, &mut [0u8; 0]);
+			result = runtime.bench_caller_is_root(&mut MappedMemory::new(&mut [0u8; 0]));
 		}
 		assert_eq!(result.unwrap(), 1u32);
 	}
@@ -727,7 +573,7 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_address(&mut runtime, &mut memory, 4, 0);
+			result = runtime.bench_address(&mut MappedMemory::new(&mut memory), 4, 0);
 		}
 		assert_ok!(result);
 		assert_eq!(
@@ -746,7 +592,7 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal1_gas_left(&mut runtime, &mut memory, 4, 0);
+			result = runtime.bench_gas_left_full(&mut MappedMemory::new(&mut memory), 4, 0);
 		}
 		assert_ok!(result);
 		assert_eq!(
@@ -762,7 +608,7 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_seal_balance(&mut runtime, &mut memory, 4, 0);
+			result = runtime.bench_balance(&mut MappedMemory::new(&mut memory), 4, 0);
 		}
 		assert_ok!(result);
 		assert_eq!(
@@ -778,7 +624,7 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_value_transferred(&mut runtime, &mut memory, 4, 0);
+			result = runtime.bench_value_transferred(&mut MappedMemory::new(&mut memory), 4, 0);
 		}
 		assert_ok!(result);
 		assert_eq!(
@@ -794,7 +640,7 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_minimum_balance(&mut runtime, &mut memory, 4, 0);
+			result = runtime.bench_minimum_balance(&mut MappedMemory::new(&mut memory), 4, 0);
 		}
 		assert_ok!(result);
 		assert_eq!(
@@ -810,7 +656,7 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_seal_block_number(&mut runtime, &mut memory, 4, 0);
+			result = runtime.bench_block_number(&mut MappedMemory::new(&mut memory), 4, 0);
 		}
 		assert_ok!(result);
 		assert_eq!(
@@ -826,7 +672,7 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_seal_now(&mut runtime, &mut memory, 4, 0);
+			result = runtime.bench_now(&mut MappedMemory::new(&mut memory), 4, 0);
 		}
 		assert_ok!(result);
 		assert_eq!(<MomentOf<T>>::decode(&mut &memory[4..]).unwrap(), *runtime.ext().now());
@@ -840,9 +686,8 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal1_weight_to_fee(
-				&mut runtime,
-				&mut memory,
+			result = runtime.bench_weight_to_fee_full(
+				&mut MappedMemory::new(&mut memory),
 				weight.ref_time(),
 				weight.proof_size(),
 				4,
@@ -865,7 +710,7 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_input(&mut runtime, &mut memory, 4, 0);
+			result = runtime.bench_input(&mut MappedMemory::new(&mut memory), 4, 0);
 		}
 		assert_ok!(result);
 		assert_eq!(&memory[4..], &vec![42u8; n as usize]);
@@ -878,7 +723,7 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_seal_return(&mut runtime, &mut memory, 0, 0, n);
+			result = runtime.bench_seal_return(&mut MappedMemory::new(&mut memory), 0, 0, n);
 		}
 
 		assert!(matches!(
@@ -900,53 +745,19 @@ mod benchmarks {
 
 		(0..n).for_each(|i| {
 			let new_code = WasmModule::<T>::dummy_with_bytes(65 + i);
-			Contracts::<T>::store_code_raw(new_code.code, caller.clone()).unwrap();
+			Contracts::<T>::bare_upload_code(caller.clone(), new_code.code, None).unwrap();
 			runtime.ext().lock_delegate_dependency(new_code.hash).unwrap();
 		});
 
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal1_terminate(&mut runtime, &mut memory, 0);
+			result = runtime.bench_terminate(&mut MappedMemory::new(&mut memory), 0);
 		}
 
 		assert!(matches!(result, Err(crate::wasm::TrapReason::Termination)));
 
 		Ok(())
-	}
-
-	// We benchmark only for the maximum subject length. We assume that this is some lowish
-	// number (< 1 KB). Therefore we are not overcharging too much in case a smaller subject is
-	// used.
-	#[benchmark(pov_mode = Measured)]
-	fn seal_random() {
-		let subject_len = T::Schedule::get().limits.subject_len;
-		assert!(subject_len < 1024);
-
-		let output_len =
-			<(SeedOf<T>, BlockNumberFor<T>) as MaxEncodedLen>::max_encoded_len() as u32;
-
-		build_runtime!(runtime, memory: [
-			output_len.to_le_bytes(),
-			vec![42u8; subject_len as _],
-			vec![0u8; output_len as _],
-		]);
-
-		let result;
-		#[block]
-		{
-			result = BenchEnv::seal0_random(
-				&mut runtime,
-				&mut memory,
-				4,               // subject_ptr
-				subject_len,     // subject_len
-				subject_len + 4, // output_ptr
-				0,               // output_len_ptr
-			);
-		}
-
-		assert_ok!(result);
-		assert_ok!(<(SeedOf<T>, BlockNumberFor<T>)>::decode(&mut &memory[subject_len as _..]));
 	}
 
 	// Benchmark the overhead that topics generate.
@@ -969,9 +780,8 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_deposit_event(
-				&mut runtime,
-				&mut memory,
+			result = runtime.bench_deposit_event(
+				&mut MappedMemory::new(&mut memory),
 				4,              // topics_ptr
 				topics_len,     // topics_len
 				4 + topics_len, // data_ptr
@@ -1008,7 +818,7 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_debug_message(&mut runtime, &mut memory, 0, i);
+			result = runtime.bench_debug_message(&mut MappedMemory::new(&mut memory), 0, i);
 		}
 		assert_ok!(result);
 		assert_eq!(setup.debug_message().unwrap().len() as u32, i);
@@ -1035,9 +845,8 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal2_set_storage(
-				&mut runtime,
-				&mut memory,
+			result = runtime.bench_set_storage(
+				&mut MappedMemory::new(&mut memory),
 				0,           // key_ptr
 				max_key_len, // key_len
 				max_key_len, // value_ptr
@@ -1066,7 +875,8 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal1_clear_storage(&mut runtime, &mut memory, 0, max_key_len);
+			result =
+				runtime.bench_clear_storage(&mut MappedMemory::new(&mut memory), 0, max_key_len);
 		}
 
 		assert_ok!(result);
@@ -1091,9 +901,8 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal1_get_storage(
-				&mut runtime,
-				&mut memory,
+			result = runtime.bench_get_storage(
+				&mut MappedMemory::new(&mut memory),
 				0,           // key_ptr
 				max_key_len, // key_len
 				out_ptr,     // out_ptr
@@ -1122,7 +931,8 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal1_contains_storage(&mut runtime, &mut memory, 0, max_key_len);
+			result =
+				runtime.bench_contains_storage(&mut MappedMemory::new(&mut memory), 0, max_key_len);
 		}
 
 		assert_eq!(result.unwrap(), n);
@@ -1147,9 +957,8 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_take_storage(
-				&mut runtime,
-				&mut memory,
+			result = runtime.bench_take_storage(
+				&mut MappedMemory::new(&mut memory),
 				0,           // key_ptr
 				max_key_len, // key_len
 				out_ptr,     // out_ptr
@@ -1311,9 +1120,8 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_set_transient_storage(
-				&mut runtime,
-				&mut memory,
+			result = runtime.bench_set_transient_storage(
+				&mut MappedMemory::new(&mut memory),
 				0,           // key_ptr
 				max_key_len, // key_len
 				max_key_len, // value_ptr
@@ -1343,8 +1151,11 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result =
-				BenchEnv::seal0_clear_transient_storage(&mut runtime, &mut memory, 0, max_key_len);
+			result = runtime.bench_clear_transient_storage(
+				&mut MappedMemory::new(&mut memory),
+				0,
+				max_key_len,
+			);
 		}
 
 		assert_ok!(result);
@@ -1370,9 +1181,8 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_get_transient_storage(
-				&mut runtime,
-				&mut memory,
+			result = runtime.bench_get_transient_storage(
+				&mut MappedMemory::new(&mut memory),
 				0,           // key_ptr
 				max_key_len, // key_len
 				out_ptr,     // out_ptr
@@ -1405,9 +1215,8 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_contains_transient_storage(
-				&mut runtime,
-				&mut memory,
+			result = runtime.bench_contains_transient_storage(
+				&mut MappedMemory::new(&mut memory),
 				0,
 				max_key_len,
 			);
@@ -1437,9 +1246,8 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_take_transient_storage(
-				&mut runtime,
-				&mut memory,
+			result = runtime.bench_take_transient_storage(
+				&mut MappedMemory::new(&mut memory),
 				0,           // key_ptr
 				max_key_len, // key_len
 				out_ptr,     // out_ptr
@@ -1468,19 +1276,15 @@ mod benchmarks {
 		let account_bytes = account.encode();
 		let account_len = account_bytes.len() as u32;
 		let value_bytes = value.encode();
-		let value_len = value_bytes.len() as u32;
 		let mut memory = memory!(account_bytes, value_bytes,);
 
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_transfer(
-				&mut runtime,
-				&mut memory,
-				0, // account_ptr
-				account_len,
-				account_len,
-				value_len,
+			result = runtime.bench_transfer(
+				&mut MappedMemory::new(&mut memory),
+				0,           // account_ptr
+				account_len, // value_ptr
 			);
 		}
 
@@ -1515,9 +1319,8 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal2_call(
-				&mut runtime,
-				&mut memory,
+			result = runtime.bench_call(
+				&mut MappedMemory::new(&mut memory),
 				CallFlags::CLONE_INPUT.bits(), // flags
 				0,                             // callee_ptr
 				0,                             // ref_time_limit
@@ -1548,9 +1351,8 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_delegate_call(
-				&mut runtime,
-				&mut memory,
+			result = runtime.bench_delegate_call(
+				&mut MappedMemory::new(&mut memory),
 				0,        // flags
 				0,        // code_hash_ptr
 				0,        // input_data_ptr
@@ -1610,9 +1412,8 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal2_instantiate(
-				&mut runtime,
-				&mut memory,
+			result = runtime.bench_instantiate(
+				&mut MappedMemory::new(&mut memory),
 				0,                   // code_hash_ptr
 				0,                   // ref_time_limit
 				0,                   // proof_size_limit
@@ -1643,7 +1444,7 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_hash_sha2_256(&mut runtime, &mut memory, 32, n, 0);
+			result = runtime.bench_hash_sha2_256(&mut MappedMemory::new(&mut memory), 32, n, 0);
 		}
 		assert_eq!(sp_io::hashing::sha2_256(&memory[32..]), &memory[0..32]);
 		assert_ok!(result);
@@ -1657,7 +1458,7 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_hash_keccak_256(&mut runtime, &mut memory, 32, n, 0);
+			result = runtime.bench_hash_keccak_256(&mut MappedMemory::new(&mut memory), 32, n, 0);
 		}
 		assert_eq!(sp_io::hashing::keccak_256(&memory[32..]), &memory[0..32]);
 		assert_ok!(result);
@@ -1671,7 +1472,7 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_hash_blake2_256(&mut runtime, &mut memory, 32, n, 0);
+			result = runtime.bench_hash_blake2_256(&mut MappedMemory::new(&mut memory), 32, n, 0);
 		}
 		assert_eq!(sp_io::hashing::blake2_256(&memory[32..]), &memory[0..32]);
 		assert_ok!(result);
@@ -1685,7 +1486,7 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_hash_blake2_128(&mut runtime, &mut memory, 16, n, 0);
+			result = runtime.bench_hash_blake2_128(&mut MappedMemory::new(&mut memory), 16, n, 0);
 		}
 		assert_eq!(sp_io::hashing::blake2_128(&memory[16..]), &memory[0..16]);
 		assert_ok!(result);
@@ -1710,9 +1511,8 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_sr25519_verify(
-				&mut runtime,
-				&mut memory,
+			result = runtime.bench_sr25519_verify(
+				&mut MappedMemory::new(&mut memory),
 				0,                              // signature_ptr
 				sig_len,                        // pub_key_ptr
 				message_len,                    // message_len
@@ -1739,9 +1539,8 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_ecdsa_recover(
-				&mut runtime,
-				&mut memory,
+			result = runtime.bench_ecdsa_recover(
+				&mut MappedMemory::new(&mut memory),
 				0,       // signature_ptr
 				65,      // message_hash_ptr
 				65 + 32, // output_ptr
@@ -1763,9 +1562,8 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_ecdsa_to_eth_address(
-				&mut runtime,
-				&mut memory,
+			result = runtime.bench_ecdsa_to_eth_address(
+				&mut MappedMemory::new(&mut memory),
 				20, // key_ptr
 				0,  // output_ptr
 			);
@@ -1785,7 +1583,7 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_set_code_hash(&mut runtime, &mut memory, 0);
+			result = runtime.bench_set_code_hash(&mut MappedMemory::new(&mut memory), 0);
 		}
 
 		assert_ok!(result);
@@ -1803,7 +1601,7 @@ mod benchmarks {
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_lock_delegate_dependency(&mut runtime, &mut memory, 0);
+			result = runtime.bench_lock_delegate_dependency(&mut MappedMemory::new(&mut memory), 0);
 		}
 
 		assert_ok!(result);
@@ -1817,57 +1615,23 @@ mod benchmarks {
 			.code_hash;
 
 		build_runtime!(runtime, memory: [ code_hash.encode(),]);
-		BenchEnv::seal0_lock_delegate_dependency(&mut runtime, &mut memory, 0).unwrap();
+		runtime
+			.bench_lock_delegate_dependency(&mut MappedMemory::new(&mut memory), 0)
+			.unwrap();
 
 		let result;
 		#[block]
 		{
-			result = BenchEnv::seal0_unlock_delegate_dependency(&mut runtime, &mut memory, 0);
+			result =
+				runtime.bench_unlock_delegate_dependency(&mut MappedMemory::new(&mut memory), 0);
 		}
 
 		assert_ok!(result);
 		Ok(())
 	}
 
-	#[benchmark(pov_mode = Measured)]
-	fn seal_reentrance_count() {
-		build_runtime!(runtime, memory: []);
-		let result;
-		#[block]
-		{
-			result = BenchEnv::seal0_reentrance_count(&mut runtime, &mut memory)
-		}
-
-		assert_eq!(result.unwrap(), 0);
-	}
-
-	#[benchmark(pov_mode = Measured)]
-	fn seal_account_reentrance_count() {
-		let Contract { account_id, .. } =
-			Contract::<T>::with_index(1, WasmModule::dummy(), vec![]).unwrap();
-		build_runtime!(runtime, memory: [account_id.encode(),]);
-
-		let result;
-		#[block]
-		{
-			result = BenchEnv::seal0_account_reentrance_count(&mut runtime, &mut memory, 0);
-		}
-
-		assert_eq!(result.unwrap(), 0);
-	}
-
-	#[benchmark(pov_mode = Measured)]
-	fn seal_instantiation_nonce() {
-		build_runtime!(runtime, memory: []);
-
-		let result;
-		#[block]
-		{
-			result = BenchEnv::seal0_instantiation_nonce(&mut runtime, &mut memory);
-		}
-
-		assert_eq!(result.unwrap(), 1);
-	}
+	/*
+	// TODO: has to be rewritten in RISC-V assembler, can use the call_builder (no need for extra sandbox type)
 
 	// We load `i64` values from random linear memory locations and store the loaded
 	// values back into yet another random linear memory location.
@@ -1900,7 +1664,7 @@ mod benchmarks {
 						Instruction::I32Const(c0), // address for `i64.load_8s`
 						Instruction::I64Load8S(0, 0),
 						Instruction::SetLocal(0),  /* temporarily store value loaded in
-						                            * `i64.load_8s` */
+													* `i64.load_8s` */
 						Instruction::I32Const(c1), // address for `i64.store8`
 						Instruction::GetLocal(0),  // value to be stores in `i64.store8`
 						Instruction::I64Store8(0, 0),
@@ -1915,6 +1679,8 @@ mod benchmarks {
 		}
 		Ok(())
 	}
+
+	*/
 
 	// This is no benchmark. It merely exist to have an easy way to pretty print the currently
 	// configured `Schedule` during benchmark development. Check the README on how to print this.

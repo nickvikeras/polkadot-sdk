@@ -17,12 +17,12 @@
 
 use crate::{
 	benchmarking::{Contract, WasmModule},
-	exec::{Ext, Key, Stack},
+	exec::{ExportedFunction, Ext, Key, Stack},
 	storage::meter::Meter,
 	transient_storage::MeterEntry,
-	wasm::Runtime,
-	BalanceOf, Config, DebugBufferVec, Determinism, Error, ExecReturnValue, GasMeter, Origin,
-	Schedule, TypeInfo, WasmBlob, Weight,
+	wasm::{ApiVersion, PreparedCall, Runtime},
+	BalanceOf, Config, DebugBufferVec, Error, GasMeter, Origin, Schedule, TypeInfo, WasmBlob,
+	Weight,
 };
 use alloc::{vec, vec::Vec};
 use codec::{Encode, HasCompact};
@@ -31,19 +31,6 @@ use frame_benchmarking::benchmarking;
 use sp_core::Get;
 
 type StackExt<'a, T> = Stack<'a, T, WasmBlob<T>>;
-
-/// A prepared contract call ready to be executed.
-pub struct PreparedCall<'a, T: Config> {
-	func: wasmi::Func,
-	store: wasmi::Store<Runtime<'a, StackExt<'a, T>>>,
-}
-
-impl<'a, T: Config> PreparedCall<'a, T> {
-	pub fn call(mut self) -> ExecReturnValue {
-		let result = self.func.call(&mut self.store, &[], &mut []);
-		WasmBlob::<T>::process_result(self.store, result).unwrap()
-	}
-}
 
 /// A builder used to prepare a contract call.
 pub struct CallSetup<T: Config> {
@@ -55,7 +42,6 @@ pub struct CallSetup<T: Config> {
 	schedule: Schedule<T>,
 	value: BalanceOf<T>,
 	debug_message: Option<DebugBufferVec<T>>,
-	determinism: Determinism,
 	data: Vec<u8>,
 	transient_storage_size: u32,
 }
@@ -103,7 +89,6 @@ where
 			schedule: T::Schedule::get(),
 			value: 0u32.into(),
 			debug_message: None,
-			determinism: Determinism::Enforced,
 			data: vec![],
 			transient_storage_size: 0,
 		}
@@ -164,7 +149,6 @@ where
 			&self.schedule,
 			self.value,
 			self.debug_message.as_mut(),
-			self.determinism,
 		);
 		if self.transient_storage_size > 0 {
 			Self::with_transient_storage(&mut ext.0, self.transient_storage_size).unwrap();
@@ -177,9 +161,14 @@ where
 		ext: &'a mut StackExt<'a, T>,
 		module: WasmBlob<T>,
 		input: Vec<u8>,
-	) -> PreparedCall<'a, T> {
-		let (func, store) = module.bench_prepare_call(ext, input);
-		PreparedCall { func, store }
+	) -> PreparedCall<'a, StackExt<'a, T>> {
+		module
+			.prepare_call(
+				Runtime::new(ext, input),
+				ExportedFunction::Call,
+				ApiVersion::UnsafeNewest,
+			)
+			.unwrap()
 	}
 
 	/// Add transient_storage
