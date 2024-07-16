@@ -72,7 +72,7 @@ Each contract is one WebAssembly module that looks like this:
 ```
 
 The documentation of all importable functions can be found
-[here](https://paritytech.github.io/substrate/master/pallet_contracts/api_doc/trait.Current.html).
+[here](https://paritytech.github.io/substrate/master/pallet_contracts/trait.ApiDoc.html).
 
 ## Usage
 

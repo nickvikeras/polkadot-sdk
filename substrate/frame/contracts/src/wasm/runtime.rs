@@ -234,9 +234,9 @@ enum KeyType {
 pub use pallet_contracts_uapi::ReturnErrorCode;
 
 parameter_types! {
-	/// Getter types used by [`crate::api_doc::Current::call_runtime`]
+	/// Getter types used by [`crate::ApiDoc:call_runtime`]
 	const CallRuntimeFailed: ReturnErrorCode = ReturnErrorCode::CallRuntimeFailed;
-	/// Getter types used by [`crate::api_doc::Current::xcm_execute`]
+	/// Getter types used by [`crate::ApiDoc::xcm_execute`]
 	const XcmExecutionFailed: ReturnErrorCode = ReturnErrorCode::XcmExecutionFailed;
 }
 

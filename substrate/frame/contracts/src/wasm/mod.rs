@@ -21,7 +21,7 @@
 mod runtime;
 
 #[cfg(doc)]
-pub use crate::wasm::runtime::api_doc;
+pub use crate::wasm::runtime::ApiDoc;
 
 #[cfg(test)]
 pub use {crate::wasm::runtime::ReturnErrorCode, runtime::HIGHEST_API_VERSION};

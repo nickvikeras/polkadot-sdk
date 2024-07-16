@@ -152,7 +152,7 @@ pub use crate::{
 pub use weights::WeightInfo;
 
 #[cfg(doc)]
-pub use crate::wasm::api_doc;
+pub use crate::wasm::ApiDoc;
 
 type CodeHash<T> = <T as frame_system::Config>::Hash;
 type TrieId = BoundedVec<u8, ConstU32<128>>;

@@ -105,7 +105,7 @@ pub fn define_env(attr: TokenStream, item: TokenStream) -> TokenStream {
 	let item = syn::parse_macro_input!(item as syn::ItemMod);
 
 	match EnvDef::try_from(item) {
-		Ok(mut def) => expand_env(&mut def, !attr.is_empty()).into(),
+		Ok(mut def) => expand_env(&mut def).into(),
 		Err(e) => e.to_compile_error().into(),
 	}
 }
@@ -385,9 +385,9 @@ where
 /// Should generate source code for:
 ///  - implementations of the host functions to be added to the wasm runtime environment (see
 ///    `expand_impls()`).
-fn expand_env(def: &EnvDef, docs: bool) -> TokenStream2 {
+fn expand_env(def: &EnvDef,) -> TokenStream2 {
 	let impls = expand_impls(def);
-	let docs = docs.then_some(expand_docs(def)).unwrap_or(TokenStream2::new());
+	let docs = def.host_funcs.iter().map(expand_func_doc);
 	let highest_api_version =
 		def.host_funcs.iter().filter_map(|f| f.api_version).max().unwrap_or_default();
 
@@ -399,20 +399,17 @@ fn expand_env(def: &EnvDef, docs: bool) -> TokenStream2 {
 
 		/// Documentation of the API (host functions) available to contracts.
 		///
-		/// The `Current` trait might be the most useful doc to look at. The versioned
-		/// traits only exist for reference: If trying to find out if a specific version of
-		/// `pallet-contracts` contains a certain function.
+		/// Each of the functions in this trait represent a function that is callable
+		/// by the contract.
 		///
 		/// # Note
 		///
 		/// This module is not meant to be used by any code. Rather, it is meant to be
 		/// consumed by humans through rustdoc.
 		#[cfg(doc)]
-		pub mod api_doc {
-			use super::{TrapReason, ReturnErrorCode};
-			#docs
+		pub trait ApiDoc {
+			#( #docs )*
 		}
-
 	}
 }
 
@@ -580,28 +577,6 @@ fn expand_bench_functions(def: &EnvDef) -> TokenStream2 {
 	}
 }
 
-/// Expands documentation for host functions.
-fn expand_docs(def: &EnvDef) -> TokenStream2 {
-	let funcs = def.host_funcs.iter().map(expand_func_doc);
-
-	quote! {
-		/// Contains only the latest version of each function.
-		///
-		/// In reality there are more functions available but they are all obsolete: When a function
-		/// is updated a new **version** is added and the old versions stays available as-is.
-		/// We only list the newest version here. Some functions are available under additional
-		/// names (aliases) for historic reasons which are omitted here.
-		///
-		/// If you want an overview of all the functions available to a contact all you need
-		/// to look at is this trait. It contains only the latest version of each
-		/// function and no aliases. If you are writing a contract(language) from scratch
-		/// this is where you should look at.
-		pub trait Current {
-			#( #funcs )*
-		}
-	}
-}
-
 fn expand_func_doc(func: &HostFn) -> TokenStream2 {
 	// Remove auxiliary args: `ctx: _` and `memory: _`
 	let func_decl = {
@@ -623,11 +598,11 @@ fn expand_func_doc(func: &HostFn) -> TokenStream2 {
 			quote! { #( #docs )* }
 		};
 		let availability = if let Some(version) = func.api_version {
-			let info = format!("\n# Availability\nThis API was added in version {}.", version,);
+			let info = format!("\n# Required API version\nThis API was added in version **{}**.", version,);
 			quote! { #[doc = #info] }
 		} else {
 			let info =
-				"\n# Availability\nThis API is not standardized and only available for testing.";
+				"\n# Unstable API\nThis API is not standardized and only available for testing.";
 			quote! { #[doc = #info] }
 		};
 		quote! {
